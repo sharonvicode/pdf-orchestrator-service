@@ -1,0 +1,30 @@
+# Control de versiones y entorno local
+.git
+.gitignore
+.gitattributes
+.venv
+
+# Caches y bytecode
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.ruff_cache
+
+# Secretos / configuración local (el ejemplo sí se permite)
+.env
+.env.*
+!.env.example
+
+# No necesarios en la imagen
+tests
+*.md
+Dockerfile
+.dockerignore
+docker-compose.yml
+.vscode
+.idea
+
+# Temporales
+*.log
+*.tmp
+*.swp
