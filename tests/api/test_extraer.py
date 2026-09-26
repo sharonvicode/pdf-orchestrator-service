@@ -2,7 +2,9 @@ import pytest
 
 from app.adapters.fakes import FakeExtractor, FakePersistence, FakeValidator
 from app.dependencies import get_orchestrator_service
+from app.exceptions import ServicioNoDisponibleError, TiempoAgotadoError
 from app.services.orchestrator import OrchestratorService
+from tests.stubs import ServicioQueFalla
 
 PROBLEM_JSON = "application/problem+json"
 PDF = ("documento.pdf", b"%PDF-1.7 contenido", "application/pdf")
@@ -94,6 +96,40 @@ def test_extraer_falla_persistence_devuelve_502_problem_json(client, usar_fakes)
 
     assert response.status_code == 502
     assert response.json()["title"] == "Falló la persistencia del texto"
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "title"),
+    [
+        (ServicioNoDisponibleError, 503, "Servicio no disponible"),
+        (TiempoAgotadoError, 504, "Tiempo de espera agotado"),
+    ],
+)
+def test_extraer_error_de_comunicacion_devuelve_problem_json(client, usar_fakes, error, status, title):
+    usar_fakes(extractor=ServicioQueFalla(error("El Extractor no respondió.")))
+
+    response = client.post("/extraer", files={"file": PDF})
+
+    assert response.status_code == status
+    assert response.headers["content-type"].startswith(PROBLEM_JSON)
+    body = response.json()
+    assert body["type"] == "about:blank"
+    assert body["title"] == title
+    assert body["status"] == status
+    assert body["detail"] == "El Extractor no respondió."
+    assert body["instance"] == "/extraer"
+
+
+def test_extraer_error_de_comunicacion_no_expone_la_causa_interna(client, usar_fakes):
+    error = ServicioNoDisponibleError("El Validator no está disponible.")
+    error.__cause__ = ConnectionError("connection refused: http://10.0.0.5:9000")
+    usar_fakes(validator=ServicioQueFalla(error))
+
+    response = client.post("/extraer", files={"file": PDF})
+
+    assert response.status_code == 503
+    assert "10.0.0.5" not in response.text
+    assert "ConnectionError" not in response.text
 
 
 def test_extraer_sin_overrides_usa_fakes_por_defecto(client):
