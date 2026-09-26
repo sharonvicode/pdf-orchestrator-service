@@ -9,7 +9,7 @@ from app.exceptions import (
     TiempoAgotadoError,
 )
 from app.services.orchestrator import OrchestratorService, ResultadoExtraccion
-from tests.stubs import ServicioQueFalla
+from tests.stubs import ServicioQueFalla, ServicioQueRegistra
 
 pytestmark = pytest.mark.anyio
 
@@ -31,6 +31,19 @@ async def test_llama_primero_al_validator_con_el_archivo():
     await servicio.procesar(NOMBRE, CONTENIDO)
 
     assert validator.llamadas == [(NOMBRE, CONTENIDO)]
+
+
+async def test_llama_a_los_servicios_en_orden_validator_extractor_persistence():
+    registro: list[str] = []
+    servicio, *_ = crear_servicio(
+        validator=ServicioQueRegistra("validator", registro),
+        extractor=ServicioQueRegistra("extractor", registro),
+        persistence=ServicioQueRegistra("persistence", registro),
+    )
+
+    await servicio.procesar(NOMBRE, CONTENIDO)
+
+    assert registro == ["validator", "extractor", "persistence"]
 
 
 async def test_si_validator_rechaza_lanza_pdf_invalido_con_motivo():
