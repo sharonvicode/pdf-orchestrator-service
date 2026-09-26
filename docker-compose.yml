@@ -1,0 +1,15 @@
+# Compose MÍNIMO: levanta únicamente el Orchestrator (desarrollo local / smoke test de la imagen).
+#
+# NO es el Compose general del sistema y NO integra Validator, Extractor ni Persistence:
+#   - sus contratos, nombres de servicio y puertos están PENDIENTES DE ACUERDO CON EL EQUIPO;
+#   - la red interna común tampoco está acordada, por eso acá no se declara ninguna red
+#     (Compose usa su red por defecto).
+# Hoy el Orchestrator usa fakes, así que las URLs de .env no se contactan.
+#
+# Uso: cp .env.example .env && docker compose up --build
+services:
+  orchestrator:
+    build: .
+    env_file: .env
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
