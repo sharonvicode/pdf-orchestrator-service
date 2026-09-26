@@ -1,8 +1,15 @@
 import pytest
 
 from app.adapters.fakes import FakeExtractor, FakePersistence, FakeValidator
-from app.exceptions import ExtraccionFallidaError, PdfInvalidoError, PersistenciaFallidaError
+from app.exceptions import (
+    ExtraccionFallidaError,
+    PdfInvalidoError,
+    PersistenciaFallidaError,
+    ServicioNoDisponibleError,
+    TiempoAgotadoError,
+)
 from app.services.orchestrator import OrchestratorService, ResultadoExtraccion
+from tests.stubs import ServicioQueFalla
 
 pytestmark = pytest.mark.anyio
 
@@ -57,6 +64,26 @@ async def test_si_persistence_falla_propaga_el_error():
 
     with pytest.raises(PersistenciaFallidaError):
         await servicio.procesar(NOMBRE, CONTENIDO)
+
+
+@pytest.mark.parametrize("error", [ServicioNoDisponibleError, TiempoAgotadoError])
+@pytest.mark.parametrize("paso", ["validator", "extractor", "persistence"])
+async def test_error_de_comunicacion_en_cualquier_paso_se_propaga(paso, error):
+    servicio, *_ = crear_servicio(**{paso: ServicioQueFalla(error("El servicio no respondió."))})
+
+    with pytest.raises(error):
+        await servicio.procesar(NOMBRE, CONTENIDO)
+
+
+async def test_si_validator_no_disponible_no_llama_extractor_ni_persistence():
+    fallido = ServicioQueFalla(ServicioNoDisponibleError("El Validator no está disponible."))
+    servicio, _, extractor, persistence = crear_servicio(validator=fallido)
+
+    with pytest.raises(ServicioNoDisponibleError):
+        await servicio.procesar(NOMBRE, CONTENIDO)
+
+    assert extractor.llamadas == []
+    assert persistence.llamadas == []
 
 
 async def test_flujo_exitoso_extrae_y_persiste_el_texto():
