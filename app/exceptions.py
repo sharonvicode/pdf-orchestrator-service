@@ -23,3 +23,17 @@ class ExtraccionFallidaError(OrchestratorError):
 class PersistenciaFallidaError(OrchestratorError):
     status_code = 502
     title = "Falló la persistencia del texto"
+
+
+class ServicioNoDisponibleError(OrchestratorError):
+    """Un servicio downstream no respondió (conexión rechazada, caído, etc.)."""
+
+    status_code = 503
+    title = "Servicio no disponible"
+
+
+class TiempoAgotadoError(OrchestratorError):
+    """Un servicio downstream no respondió dentro del tiempo configurado."""
+
+    status_code = 504
+    title = "Tiempo de espera agotado"

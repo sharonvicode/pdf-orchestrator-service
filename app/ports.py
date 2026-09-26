@@ -1,4 +1,9 @@
-"""Puertos hacia los microservicios que coordina el Orchestrator."""
+"""Puertos hacia los microservicios que coordina el Orchestrator.
+
+Son contratos INTERNOS y provisorios, no contratos HTTP: los contratos con Validator,
+Extractor y Persistence están pendientes de acuerdo con el equipo. Cualquier
+implementación puede además lanzar ServicioNoDisponibleError o TiempoAgotadoError.
+"""
 
 from dataclasses import dataclass
 from typing import Protocol
