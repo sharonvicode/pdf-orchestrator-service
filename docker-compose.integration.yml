@@ -1,0 +1,172 @@
+# Compose de INTEGRACIÓN del sistema PDF ExtractText:
+#   Cliente → Traefik → Orchestrator → Validator → Extractor → Persistence → MongoDB
+#
+# - Solo Traefik publica un puerto hacia el host; el resto queda en redes internas.
+# - Validator, Extractor y Persistence se construyen desde su repositorio fijado a un SHA
+#   completo (inmutable). Cada contexto se puede reemplazar por una ruta local con
+#   VALIDATOR_CONTEXT, EXTRACTOR_CONTEXT y PERSISTENCE_CONTEXT.
+# - Base y volumen exclusivos de integración: pdf_extractext_integracion y pdf-integracion-mongo-data.
+#
+# Uso: docker compose -f docker-compose.integration.yml up --build -d --wait
+# Ver la sección "Integración con Docker Compose" del README.
+name: pdf-integracion
+
+services:
+  traefik:
+    image: traefik:v3.6
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --log.level=INFO
+    ports:
+      - "${PUBLIC_PORT:-8080}:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - edge
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  orchestrator:
+    build: .
+    environment:
+      VALIDATOR_URL: http://validator:8000
+      EXTRACTOR_URL: http://extractor:8000
+      PERSISTENCE_URL: http://persistence:8000
+      HTTP_TIMEOUT_SECONDS: "10"
+      LOG_LEVEL: INFO
+      PORT: "8000"
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=pdf-integracion-edge
+      - traefik.http.routers.orchestrator.rule=PathPrefix(`/`)
+      - traefik.http.routers.orchestrator.entrypoints=web
+      - traefik.http.services.orchestrator.loadbalancer.server.port=8000
+    networks:
+      - edge
+      - backend
+    depends_on:
+      validator:
+        condition: service_healthy
+      extractor:
+        condition: service_healthy
+      persistence:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  validator:
+    build:
+      context: "${VALIDATOR_CONTEXT:-https://github.com/sharonvicode/pdf-validator-service.git#79e22ae3e734d05567c50805ac0eab33d3cbdc5b}"
+    environment:
+      MAX_FILE_SIZE_MB: "10"
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 384M
+
+  extractor:
+    build:
+      context: "${EXTRACTOR_CONTEXT:-https://github.com/sharonvicode/pdf-extract-service.git#4166ba994cdebf6102f3608774b643bb751d2a4c}"
+    environment:
+      MAX_FILE_SIZE_MB: "10"
+      EXTRACTION_CONCURRENCY: "1"
+      EXTRACTION_QUEUE_SIZE: "20"
+      RETRY_AFTER_SECONDS: "1"
+      LOG_LEVEL: INFO
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  persistence:
+    build:
+      context: "${PERSISTENCE_CONTEXT:-https://github.com/sharonvicode/pdf-persistence-service.git#95acae239467d8de2b550d1944543536e5d29730}"
+    environment:
+      # serverSelectionTimeoutMS: si MongoDB no responde, Persistence falla a los 5 s (antes de
+      # escribir) en lugar de los 30 s por defecto de pymongo, que superan el timeout del Orchestrator.
+      MONGODB_URI: mongodb://mongo:27017/?serverSelectionTimeoutMS=5000
+      MONGODB_DATABASE: pdf_extractext_integracion
+    networks:
+      - backend
+    depends_on:
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      # Solo comprueba que el PROCESO responde (FastAPI expone /openapi.json por defecto).
+      # NO comprueba la conectividad con MongoDB: Persistence no tiene un endpoint /health.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  mongo:
+    image: mongo:8.0
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+
+networks:
+  # Traefik y Orchestrator: la única red con un puerto publicado.
+  edge:
+    name: pdf-integracion-edge
+  # Servicios internos y MongoDB, sin salida a internet.
+  backend:
+    name: pdf-integracion-backend
+    internal: true
+
+volumes:
+  mongo-data:
+    name: pdf-integracion-mongo-data
