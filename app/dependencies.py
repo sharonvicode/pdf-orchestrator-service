@@ -1,13 +1,24 @@
 """Composición de dependencias para FastAPI."""
 
-from app.adapters.fakes import FakeExtractor, FakePersistence, FakeValidator
+from typing import Annotated
+
+from fastapi import Depends, Request
+
+from app.adapters.extractor import HttpExtractor
+from app.adapters.http import ClientesHttp
+from app.adapters.persistence import HttpPersistence
+from app.adapters.validator import HttpValidator
 from app.services.orchestrator import OrchestratorService
 
 
-def get_orchestrator_service() -> OrchestratorService:
-    # TODO: reemplazar los fakes por los clientes HTTP reales de cada microservicio.
+def get_clientes(request: Request) -> ClientesHttp:
+    """Clientes HTTP compartidos que abre el lifespan."""
+    return request.app.state.clientes
+
+
+def get_orchestrator_service(clientes: Annotated[ClientesHttp, Depends(get_clientes)]) -> OrchestratorService:
     return OrchestratorService(
-        validator=FakeValidator(),
-        extractor=FakeExtractor(),
-        persistence=FakePersistence(),
+        validator=HttpValidator(clientes.validator),
+        extractor=HttpExtractor(clientes.extractor),
+        persistence=HttpPersistence(clientes.persistence),
     )

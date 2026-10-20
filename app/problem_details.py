@@ -58,7 +58,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 
 async def orchestrator_exception_handler(request: Request, exc: OrchestratorError) -> JSONResponse:
-    return problem_response(request, exc.status_code, exc.detail, title=exc.title)
+    return problem_response(request, exc.status_code, exc.detail, title=exc.title, type_=exc.type, headers=exc.headers)
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:

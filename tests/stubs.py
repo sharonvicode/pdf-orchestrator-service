@@ -1,6 +1,6 @@
 """Dobles de prueba que no forman parte de los fakes de la aplicación."""
 
-from app.ports import ResultadoValidacion
+from app.ports import TextoExtraido
 
 
 class ServicioQueRegistra:
@@ -12,14 +12,14 @@ class ServicioQueRegistra:
 
     async def validar(self, *_):
         self._registro.append(self._nombre)
-        return ResultadoValidacion(es_valido=True)
 
     async def extraer(self, *_):
         self._registro.append(self._nombre)
-        return "texto"
+        return TextoExtraido(texto="texto", cantidad_paginas=1)
 
     async def guardar(self, *_):
         self._registro.append(self._nombre)
+        return "id"
 
 
 class ServicioQueFalla:
