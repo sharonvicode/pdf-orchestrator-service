@@ -11,7 +11,7 @@ from app.services.orchestrator import OrchestratorService
 router = APIRouter()
 
 
-@router.get("/health/", response_model=HealthResponse)
+@router.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     """Indica que el Orchestrator está vivo. No consulta otros servicios."""
     return HealthResponse(status="ok")

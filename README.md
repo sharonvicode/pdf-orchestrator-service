@@ -103,9 +103,9 @@ Respuesta `200 OK`:
 }
 ```
 
-### `GET /health/`
+### `GET /health`
 
-Indica que el Orchestrator está vivo. No consulta a otros servicios. `GET /health` (sin barra) responde `307` redirigiendo a `/health/`.
+Indica que el Orchestrator está vivo. No consulta a otros servicios.
 
 Respuesta `200 OK`:
 
@@ -140,7 +140,7 @@ Los errores de validación del request incluyen además una lista `errors` con `
 | 404 / 405 | Ruta o método inexistente | — |
 | 500 | Error inesperado | — |
 
-- 503 y 504 son genéricos para cualquier servicio downstream. Los adapters HTTP futuros deberán traducir a estos errores sus fallos de conexión y timeout; como `httpx.TimeoutException` es subclase de `httpx.TransportError`, hay que capturar primero el timeout.
+- 503 y 504 son genéricos para cualquier servicio downstream. `errores_de_transporte()` (`app/adapters/http.py`) traduce los fallos de conexión y timeout de httpx con mensajes fijos; como `httpx.TimeoutException` es subclase de `httpx.TransportError`, captura primero el timeout.
 - Nunca se exponen al cliente detalles internos (causas, trazas, hosts). El detalle de los 500 queda solo en el log, y los adapters deben usar mensajes fijos en `detail`, no el texto de la excepción original.
 
 ## Estado de contratos externos — ⚠️ PENDIENTE
@@ -189,9 +189,9 @@ Se centraliza en `app/config.py` (`Settings`, basada en `pydantic-settings`). Se
 
 - Estas variables son **configuración propuesta por el Orchestrator, no contratos definitivos del equipo**.
 - Las URLs aceptan hostnames de Docker (por ejemplo `http://validator:8000`) y no tienen valor por defecto. `HttpUrl` normaliza agregando `/` final, así que los adapters deberán usar `httpx.AsyncClient(base_url=...)` con paths relativos.
-- `main.run()` construye `Settings` al arrancar el servidor: si falta una variable obligatoria o hay un valor inválido, el proceso falla **antes** de levantar. Usa `PORT` y `LOG_LEVEL`; las URLs y el timeout los usarán los adapters HTTP.
-- Importar la app (`main:app`) no lee la configuración, así que los tests no necesitan `.env`.
-- A futuro, cuando los adapters la necesiten por request: `get_settings()` perezoso y `app.dependency_overrides` en tests.
+- `main.run()` construye `Settings` al arrancar el servidor: si falta una variable obligatoria o hay un valor inválido, el proceso falla **antes** de levantar. Usa `PORT` y `LOG_LEVEL`.
+- El `lifespan` de FastAPI vuelve a leer `Settings` y abre un `httpx.AsyncClient` compartido por servicio (`app/adapters/http.py`), con su URL como `base_url` y `HTTP_TIMEOUT_SECONDS` como timeout. Los cierra al apagar. Si la configuración es inválida, la app no arranca.
+- Importar la app (`main:app`) no lee la configuración: los tests que no ejecutan el lifespan no necesitan `.env`.
 
 ## Desarrollo
 
@@ -222,7 +222,7 @@ Los tests no levantan otros servicios: usan los fakes de `app/adapters/fakes.py`
 - instala exactamente `uv.lock` (`uv sync --frozen --no-dev`), sin dependencias de desarrollo;
 - corre como usuario no-root (`appuser`);
 - arranca con `python main.py`, que valida la configuración y respeta `PORT` y `LOG_LEVEL`;
-- `HEALTHCHECK` contra `GET /health/` en el `PORT` configurado.
+- `HEALTHCHECK` contra `GET /health` en el `PORT` configurado.
 
 ```bash
 docker build -t pdf-orchestrator .
