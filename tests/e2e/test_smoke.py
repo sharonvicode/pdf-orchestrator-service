@@ -44,7 +44,7 @@ CONTRATOS = {
 
 
 def compose(*argumentos: str) -> str:
-    resultado = subprocess.run([*COMPOSE, *argumentos], capture_output=True, text=True, check=True, timeout=120)
+    resultado = subprocess.run([*COMPOSE, *argumentos], capture_output=True, text=True, encoding="utf-8", check=True, timeout=120)
     return resultado.stdout.strip()
 
 
