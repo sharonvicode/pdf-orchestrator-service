@@ -56,6 +56,22 @@ El caso de uso no conoce URLs ni formatos de transporte, y se prueba con los fak
 
 Cualquier port puede además lanzar `ServicioNoDisponibleError` o `TiempoAgotadoError`.
 
+### Revisión de principios (SOLID, KISS, DRY, YAGNI)
+
+Registro de la revisión del diseño actual: qué se comprobó y qué límites se aceptaron. No es una garantía de que el diseño sea definitivo.
+
+| Principio | Cómo se aplica | Límites conocidos |
+|-----------|----------------|-------------------|
+| **SRP** | `routes.py` solo recibe el archivo y arma la respuesta; `OrchestratorService.procesar` solo encadena `validar` → `extraer` → `guardar`; cada adapter traduce un único contrato HTTP. | Cada adapter hace la llamada y además traduce sus errores; se mantienen juntos porque la traducción depende del contrato de ese servicio. |
+| **OCP / DIP** | `OrchestratorService` depende de los `Protocol` de `app/ports.py`, no de httpx; `app/dependencies.py` es el único lugar que elige los adapters HTTP. | Agregar un paso al flujo sí requiere cambiar el caso de uso: el flujo es fijo a propósito. |
+| **LSP** | Los adapters HTTP, los fakes y los dobles de `tests/stubs.py` cumplen los mismos ports, y el caso de uso se prueba igual con cualquiera de ellos. | Los `Protocol` no se comprueban en ejecución; lo sostienen los tipos y los tests. |
+| **ISP** | Un port por servicio, con un único método cada uno (`validar`, `extraer`, `guardar`). | — |
+| **DRY** | `app/adapters/http.py` reúne lo común a los adapters: `errores_de_transporte`, `leer_problema`, `archivo_pdf`, `rechazo_del_archivo` y `no_disponible`. | `_rechazo` del Validator y del Extractor se parecen, pero no se unifican: cada uno aplica reglas distintas de su contrato. Los healthchecks de `docker-compose.integration.yml` repiten la misma línea. |
+| **KISS** | Un `httpx.AsyncClient` por servicio, abierto en el `lifespan`; sin reintentos, colas ni circuit breaker; los fallos se reducen a `502`, `503`, `504` y los rechazos propagados. | Un único `HTTP_TIMEOUT_SECONDS` para los tres servicios, aplicado por fase y no como límite total. |
+| **YAGNI** | Sin caché ni reintentos; `/health` no consulta otros servicios; no hay variables de configuración sin uso. | `app/adapters/fakes.py` solo lo usan los tests, pero vive en el paquete `app` (ver abajo). |
+
+**`app/adapters/fakes.py`.** Solo lo importan `tests/api/test_extraer.py` y `tests/unit/test_orchestrator_service.py`; ni `main.py` ni otro módulo de `app/` lo importa, así que no participa de la ejecución. Se incluye en la imagen porque el `Dockerfile` copia `app/` completo; es un archivo chico y sin dependencias propias. Moverlo a `tests/` sería más prolijo, pero obligaría a cambiar los imports de esas pruebas sin corregir ningún defecto, así que se deja donde está.
+
 ## Estructura del proyecto
 
 ```
