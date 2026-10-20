@@ -1,7 +1,5 @@
 """Dobles de prueba que no forman parte de los fakes de la aplicación."""
 
-from app.ports import ResultadoValidacion
-
 
 class ServicioQueRegistra:
     """Cumple los tres ports con éxito y anota su nombre en un registro compartido."""
@@ -12,7 +10,6 @@ class ServicioQueRegistra:
 
     async def validar(self, *_):
         self._registro.append(self._nombre)
-        return ResultadoValidacion(es_valido=True)
 
     async def extraer(self, *_):
         self._registro.append(self._nombre)

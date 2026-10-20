@@ -2,8 +2,8 @@ import pytest
 
 from app.adapters.fakes import FakeExtractor, FakePersistence, FakeValidator
 from app.exceptions import (
+    ArchivoRechazadoError,
     ExtraccionFallidaError,
-    PdfInvalidoError,
     PersistenciaFallidaError,
     ServicioNoDisponibleError,
     TiempoAgotadoError,
@@ -15,6 +15,7 @@ pytestmark = pytest.mark.anyio
 
 NOMBRE = "documento.pdf"
 CONTENIDO = b"%PDF-1.7 contenido"
+RECHAZO = ArchivoRechazadoError(415, "/errors/unsupported-file-type", "Tipo de archivo no soportado", "No es un PDF")
 
 
 def crear_servicio(validator=None, extractor=None, persistence=None):
@@ -46,17 +47,19 @@ async def test_llama_a_los_servicios_en_orden_validator_extractor_persistence():
     assert registro == ["validator", "extractor", "persistence"]
 
 
-async def test_si_validator_rechaza_lanza_pdf_invalido_con_motivo():
-    servicio, *_ = crear_servicio(validator=FakeValidator(es_valido=False, motivo="No es un PDF"))
+async def test_si_validator_rechaza_propaga_el_rechazo():
+    servicio, *_ = crear_servicio(validator=FakeValidator(rechazo=RECHAZO))
 
-    with pytest.raises(PdfInvalidoError, match="No es un PDF"):
+    with pytest.raises(ArchivoRechazadoError) as error:
         await servicio.procesar(NOMBRE, CONTENIDO)
+
+    assert error.value is RECHAZO
 
 
 async def test_si_validator_rechaza_no_llama_extractor_ni_persistence():
-    servicio, _, extractor, persistence = crear_servicio(validator=FakeValidator(es_valido=False))
+    servicio, _, extractor, persistence = crear_servicio(validator=FakeValidator(rechazo=RECHAZO))
 
-    with pytest.raises(PdfInvalidoError):
+    with pytest.raises(ArchivoRechazadoError):
         await servicio.procesar(NOMBRE, CONTENIDO)
 
     assert extractor.llamadas == []

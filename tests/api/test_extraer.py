@@ -1,8 +1,10 @@
+import httpx
 import pytest
 
 from app.adapters.fakes import FakeExtractor, FakePersistence, FakeValidator
-from app.dependencies import get_orchestrator_service
-from app.exceptions import ServicioNoDisponibleError, TiempoAgotadoError
+from app.adapters.http import ClientesHttp
+from app.dependencies import get_clientes, get_orchestrator_service
+from app.exceptions import ArchivoRechazadoError, ServicioNoDisponibleError, TiempoAgotadoError
 from app.services.orchestrator import OrchestratorService
 from tests.stubs import ServicioQueFalla
 
@@ -64,17 +66,23 @@ def test_extraer_sin_archivo_devuelve_422_problem_json(client, usar_fakes):
     assert response.json()["errors"][0]["loc"] == ["body", "file"]
 
 
-def test_extraer_pdf_invalido_devuelve_422_problem_json(client, usar_fakes, fakes):
-    usar_fakes(validator=FakeValidator(es_valido=False, motivo="No es un PDF"))
+def test_extraer_rechazo_del_validator_conserva_status_type_y_detail(client, usar_fakes, fakes):
+    rechazo = ArchivoRechazadoError(
+        422, "/errors/invalid-pdf", "PDF inválido", "El PDF está dañado o no se puede leer."
+    )
+    usar_fakes(validator=FakeValidator(rechazo=rechazo))
 
     response = client.post("/extraer", files={"file": PDF})
 
     assert response.status_code == 422
     assert response.headers["content-type"].startswith(PROBLEM_JSON)
-    body = response.json()
-    assert body["title"] == "PDF inválido"
-    assert body["detail"] == "No es un PDF"
-    assert body["instance"] == "/extraer"
+    assert response.json() == {
+        "type": "/errors/invalid-pdf",
+        "title": "PDF inválido",
+        "status": 422,
+        "detail": "El PDF está dañado o no se puede leer.",
+        "instance": "/extraer",
+    }
     assert fakes[1].llamadas == []
 
 
@@ -132,8 +140,27 @@ def test_extraer_error_de_comunicacion_no_expone_la_causa_interna(client, usar_f
     assert "ConnectionError" not in response.text
 
 
-def test_extraer_sin_overrides_usa_fakes_por_defecto(client):
-    response = client.post("/extraer", files={"file": PDF})
+def test_extraer_sin_overrides_valida_con_el_validator_http(app, client):
+    recibidos = []
 
-    assert response.status_code == 200
-    assert response.json()["exito"] is True
+    def validator(request: httpx.Request) -> httpx.Response:
+        recibidos.append(request.url.path)
+        cuerpo = {
+            "type": "/errors/unsupported-file-type",
+            "title": "Tipo de archivo no soportado",
+            "status": 415,
+            "detail": "El archivo debe tener extensión .pdf.",
+            "instance": "/validate",
+        }
+        return httpx.Response(415, json=cuerpo, headers={"content-type": PROBLEM_JSON})
+
+    cliente = httpx.AsyncClient(base_url="http://validator.example/", transport=httpx.MockTransport(validator))
+    app.dependency_overrides[get_clientes] = lambda: ClientesHttp(cliente, cliente, cliente)
+
+    response = client.post("/extraer", files={"file": ("notas.txt", b"hola", "text/plain")})
+
+    app.dependency_overrides.clear()
+    assert recibidos == ["/validate"]
+    assert response.status_code == 415
+    assert response.json()["type"] == "/errors/unsupported-file-type"
+    assert response.json()["detail"] == "El archivo debe tener extensión .pdf."
