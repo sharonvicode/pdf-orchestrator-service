@@ -4,7 +4,8 @@ from typing import Annotated
 
 from fastapi import Depends, Request
 
-from app.adapters.fakes import FakeExtractor, FakePersistence
+from app.adapters.extractor import HttpExtractor
+from app.adapters.fakes import FakePersistence
 from app.adapters.http import ClientesHttp
 from app.adapters.validator import HttpValidator
 from app.services.orchestrator import OrchestratorService
@@ -16,9 +17,9 @@ def get_clientes(request: Request) -> ClientesHttp:
 
 
 def get_orchestrator_service(clientes: Annotated[ClientesHttp, Depends(get_clientes)]) -> OrchestratorService:
-    # TODO: reemplazar los fakes de Extractor y Persistence por sus adapters HTTP.
+    # TODO: reemplazar el fake de Persistence por su adapter HTTP.
     return OrchestratorService(
         validator=HttpValidator(clientes.validator),
-        extractor=FakeExtractor(),
+        extractor=HttpExtractor(clientes.extractor),
         persistence=FakePersistence(),
     )

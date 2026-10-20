@@ -8,8 +8,10 @@ from typing import Any
 import httpx
 
 from app.config import Settings
-from app.exceptions import ServicioNoDisponibleError, TiempoAgotadoError
+from app.exceptions import ArchivoRechazadoError, ServicioNoDisponibleError, TiempoAgotadoError
 from app.problem_details import PROBLEM_JSON
+
+PDF_MIME_TYPE = "application/pdf"
 
 
 @dataclass(frozen=True)
@@ -42,8 +44,21 @@ def leer_problema(respuesta: httpx.Response) -> dict[str, Any] | None:
     return cuerpo if isinstance(cuerpo, dict) else None
 
 
-def no_disponible(servicio: str) -> ServicioNoDisponibleError:
-    return ServicioNoDisponibleError(f"El servicio {servicio} no está disponible.")
+def archivo_pdf(nombre_archivo: str, contenido: bytes) -> dict[str, tuple[str, bytes, str]]:
+    """Campo multipart `file` con el archivo, siempre enviado como application/pdf."""
+    return {"file": (nombre_archivo, contenido, PDF_MIME_TYPE)}
+
+
+def rechazo_del_archivo(status_code: int, type_: str, problema: dict[str, Any]) -> ArchivoRechazadoError | None:
+    """Rechazo con el title y detail del problema, o None si alguno no es texto."""
+    title, detail = problema.get("title"), problema.get("detail")
+    if not (isinstance(title, str) and isinstance(detail, str)):
+        return None
+    return ArchivoRechazadoError(status_code, type_, title, detail)
+
+
+def no_disponible(servicio: str, retry_after: str | None = None) -> ServicioNoDisponibleError:
+    return ServicioNoDisponibleError(f"El servicio {servicio} no está disponible.", retry_after=retry_after)
 
 
 @contextmanager

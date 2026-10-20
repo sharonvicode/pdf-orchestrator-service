@@ -5,6 +5,7 @@ class OrchestratorError(Exception):
     status_code: int = 500
     type: str = "about:blank"
     title: str = "Error del Orchestrator"
+    headers: dict[str, str] | None = None
 
     def __init__(self, detail: str):
         super().__init__(detail)
@@ -43,6 +44,11 @@ class ServicioNoDisponibleError(OrchestratorError):
 
     status_code = 503
     title = "Servicio no disponible"
+
+    def __init__(self, detail: str, retry_after: str | None = None):
+        super().__init__(detail)
+        if retry_after:
+            self.headers = {"Retry-After": retry_after}
 
 
 class TiempoAgotadoError(OrchestratorError):
