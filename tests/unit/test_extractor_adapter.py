@@ -99,23 +99,42 @@ async def test_200_fuera_de_contrato_es_extraccion_fallida(respuesta):
         await extractor.extraer(NOMBRE, CONTENIDO)
 
 
-@pytest.mark.parametrize(
-    ("status", "title", "detail"),
-    [
-        (413, "Contenido demasiado grande", "El archivo pesa 20 bytes y supera el máximo de 10 bytes."),
-        (422, "Contenido no procesable", "El PDF no tiene texto extraíble."),
-    ],
-)
-async def test_rechazo_del_archivo_conserva_status_title_y_detail_con_type_about_blank(status, title, detail):
-    extractor = extractor_que_responde(problema(status, title=title, detail=detail))
+async def test_413_conserva_status_title_y_detail_con_type_about_blank():
+    detail = "El archivo pesa 20 bytes y supera el máximo de 10 bytes."
+    extractor = extractor_que_responde(problema(413, title="Contenido demasiado grande", detail=detail))
 
     with pytest.raises(ArchivoRechazadoError) as error:
         await extractor.extraer(NOMBRE, CONTENIDO)
 
-    assert error.value.status_code == status
+    assert error.value.status_code == 413
     assert error.value.type == "about:blank"
-    assert error.value.title == title
+    assert error.value.title == "Contenido demasiado grande"
     assert error.value.detail == detail
+
+
+@pytest.mark.parametrize(
+    "detail_interno",
+    ["No se pudo leer el archivo como PDF: code=7: no objects found", "El PDF no tiene texto extraíble."],
+)
+async def test_422_conserva_status_y_title_con_detail_fijo_sin_exponer_la_biblioteca(detail_interno):
+    extractor = extractor_que_responde(problema(422, title="Contenido no procesable", detail=detail_interno))
+
+    with pytest.raises(ArchivoRechazadoError) as error:
+        await extractor.extraer(NOMBRE, CONTENIDO)
+
+    assert error.value.status_code == 422
+    assert error.value.type == "about:blank"
+    assert error.value.title == "Contenido no procesable"
+    assert error.value.detail == "No se pudo extraer el texto del PDF: está dañado o no tiene texto extraíble."
+
+
+async def test_422_de_validacion_del_request_no_es_rechazo_del_archivo():
+    # Mismo status que el rechazo contractual: solo la extensión `errors` los distingue.
+    cuerpo = {"title": "Contenido no procesable", "detail": "La solicitud no es válida.", "errors": []}
+    extractor = extractor_que_responde(problema(422, **cuerpo))
+
+    with pytest.raises(ExtraccionFallidaError):
+        await extractor.extraer(NOMBRE, CONTENIDO)
 
 
 @pytest.mark.parametrize(
@@ -144,13 +163,23 @@ async def test_error_fuera_de_contrato_es_extraccion_fallida(respuesta):
     assert error.value.detail == "El Extractor respondió fuera del contrato esperado."
 
 
-async def test_503_es_servicio_no_disponible_y_conserva_retry_after():
-    extractor = extractor_que_responde(problema(503, headers={"Retry-After": "1"}))
+@pytest.mark.parametrize("retry_after", ["1", "Wed, 21 Oct 2015 07:28:00 GMT"])
+async def test_503_es_servicio_no_disponible_y_conserva_retry_after_valido(retry_after):
+    extractor = extractor_que_responde(problema(503, headers={"Retry-After": retry_after}))
 
     with pytest.raises(ServicioNoDisponibleError) as error:
         await extractor.extraer(NOMBRE, CONTENIDO)
 
-    assert error.value.headers == {"Retry-After": "1"}
+    assert error.value.headers == {"Retry-After": retry_after}
+
+
+async def test_503_con_retry_after_invalido_no_agrega_encabezados():
+    extractor = extractor_que_responde(problema(503, headers={"Retry-After": "pronto"}))
+
+    with pytest.raises(ServicioNoDisponibleError) as error:
+        await extractor.extraer(NOMBRE, CONTENIDO)
+
+    assert error.value.headers is None
 
 
 async def test_503_sin_retry_after_no_agrega_encabezados():

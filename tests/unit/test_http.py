@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from app.adapters.http import errores_de_transporte
+from app.adapters.http import errores_de_transporte, retry_after_valido
 from app.exceptions import ServicioNoDisponibleError, TiempoAgotadoError
 
 
@@ -35,3 +35,34 @@ def test_otros_errores_no_se_traducen():
     with pytest.raises(ValueError):
         with errores_de_transporte("Validator"):
             raise ValueError("otro error")
+
+
+@pytest.mark.parametrize(
+    "valor",
+    ["0", "1", "120", "Wed, 21 Oct 2015 07:28:00 GMT", "Sun, 06 Nov 1994 08:49:37 GMT"],
+)
+def test_retry_after_acepta_delay_seconds_e_imf_fixdate(valor):
+    assert retry_after_valido(valor) == valor
+
+
+@pytest.mark.parametrize(
+    "valor",
+    [
+        None,
+        "",
+        "pronto",
+        "-1",
+        "1.5",
+        "+5",
+        " 5",
+        "5\n",
+        "Wed, 32 Oct 2015 07:28:00 GMT",
+        "Wed, 21 Oct 2015 25:28:00 GMT",
+        "Wed, 21 Oct 2015 07:28:00 UTC",
+        "wed, 21 Oct 2015 07:28:00 GMT",
+        "Wednesday, 21-Oct-15 07:28:00 GMT",
+        "Wed Oct 21 07:28:00 2015",
+    ],
+)
+def test_retry_after_ausente_o_invalido_se_descarta(valor):
+    assert retry_after_valido(valor) is None

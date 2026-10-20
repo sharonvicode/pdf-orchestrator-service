@@ -12,6 +12,8 @@ FUERA_DE_CONTRATO = "El Extractor respondió fuera del contrato esperado."
 
 # 413 (archivo demasiado grande) y 422 (PDF que no se puede procesar) son rechazos del archivo.
 STATUS_DE_RECHAZO = {413, 422}
+# El detail del 422 puede incluir el mensaje interno de la biblioteca de PDF: no se expone.
+DETAIL_422 = "No se pudo extraer el texto del PDF: está dañado o no tiene texto extraíble."
 
 
 class _Metadatos(BaseModel):
@@ -59,4 +61,5 @@ def _rechazo(respuesta: httpx.Response) -> ArchivoRechazadoError | None:
     problema = leer_problema(respuesta)
     if respuesta.status_code not in STATUS_DE_RECHAZO or problema is None or "errors" in problema:
         return None
-    return rechazo_del_archivo(respuesta.status_code, "about:blank", problema)
+    detail_publico = DETAIL_422 if respuesta.status_code == 422 else None
+    return rechazo_del_archivo(respuesta.status_code, "about:blank", problema, detail_publico)

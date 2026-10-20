@@ -213,3 +213,17 @@ def test_extraer_sin_overrides_extrae_con_el_extractor_http(client, servicios_ht
     assert recibidos == ["/validate", "/api/v1/extraer"]
     assert response.status_code == 200
     assert response.json()["texto"] == "texto real"
+
+
+@pytest.mark.parametrize(
+    ("enviado", "publico"),
+    [({"Retry-After": "5"}, "5"), ({"Retry-After": "pronto"}, None), ({}, None)],
+    ids=["valido", "invalido", "ausente"],
+)
+def test_extraer_extractor_saturado_reenvia_solo_retry_after_valido(client, servicios_http, enviado, publico):
+    servicios_http(validate=httpx.Response(200), api_v1_extraer=httpx.Response(503, headers=enviado))
+
+    response = client.post("/extraer", files={"file": PDF})
+
+    assert response.status_code == 503
+    assert response.headers.get("retry-after") == publico
