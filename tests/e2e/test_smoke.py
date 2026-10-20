@@ -9,7 +9,12 @@ ninguna llamada entre servicios. Se salta salvo que estén definidas:
 
 Escribe exactamente UN documento en pdf_extractext_integracion.extractions
 (test_flujo_completo_persiste_y_recupera). Detiene y vuelve a iniciar Persistence
-(test_con_persistence_detenido_responde_503_sin_escribir). No borra datos ni volúmenes.
+(test_con_persistence_detenido_responde_503_sin_escribir) y pausa y reanuda el Validator
+(test_con_validator_pausado_responde_504_al_vencer_el_timeout_sin_escribir). No borra datos ni volúmenes.
+
+Si una corrida se corta sin llegar a la limpieza (proceso matado), se recupera con:
+docker compose -f docker-compose.integration.yml start persistence
+docker compose -f docker-compose.integration.yml unpause validator
 """
 
 import json
@@ -35,6 +40,7 @@ pytestmark = [
 
 COMPOSE = ["docker", "compose", "-f", str(Path(__file__).parents[2] / "docker-compose.integration.yml")]
 BASE_DE_DATOS = "pdf_extractext_integracion"
+TIMEOUT_DEL_ORCHESTRATOR = 10  # HTTP_TIMEOUT_SECONDS en docker-compose.integration.yml
 PROBLEM_JSON = "application/problem+json"
 CONTRATOS = {
     "http://validator:8000": "/validate",
@@ -187,4 +193,27 @@ def test_con_persistence_detenido_responde_503_sin_escribir():
     assert response.status_code == 503
     assert response.headers["content-type"].startswith(PROBLEM_JSON)
     assert response.json()["title"] == "Servicio no disponible"
+    assert contar_extracciones() == antes
+
+
+def test_con_validator_pausado_responde_504_al_vencer_el_timeout_sin_escribir():
+    # `pause` congela el proceso pero el kernel sigue aceptando la conexión: el Orchestrator espera
+    # de verdad hasta que vence su timeout (a diferencia de `stop`, que falla al conectar). Se pausa
+    # el Validator, el primer paso, para que el flujo nunca llegue a Persistence.
+    antes = contar_extracciones()
+    try:
+        # Dentro del try: si `pause` falla después de congelar el contenedor, igual se reanuda.
+        compose("pause", "validator")
+        inicio = time.monotonic()
+        response = subir(PDF.name, PDF.read_bytes(), "application/pdf")
+        duracion = time.monotonic() - inicio
+    finally:
+        compose("unpause", "validator")
+        esperar_healthy("validator")
+
+    assert response.status_code == 504
+    assert response.headers["content-type"].startswith(PROBLEM_JSON)
+    assert response.json()["title"] == "Tiempo de espera agotado"
+    assert response.json()["detail"] == "El servicio Validator no respondió a tiempo."
+    assert TIMEOUT_DEL_ORCHESTRATOR <= duracion < TIMEOUT_DEL_ORCHESTRATOR + 5
     assert contar_extracciones() == antes

@@ -345,6 +345,7 @@ uv run pytest -m e2e -v
 | `test_flujo_completo_persiste_y_recupera` | Respuesta pública, documento en MongoDB (`file_name`, `page_count`, largo del texto) y `GET /extractions/<id>` | **Sí: 1 documento** |
 | `test_txt_rechazado_por_el_validator_sin_escribir` | `.txt` → `415` `/errors/unsupported-file-type`, conteo sin cambios | No |
 | `test_con_persistence_detenido_responde_503_sin_escribir` | `docker compose stop persistence` → `503`, conteo sin cambios; luego `start persistence` | No |
+| `test_con_validator_pausado_responde_504_al_vencer_el_timeout_sin_escribir` | `docker compose pause validator` → `504` entre 10 y 15 s (timeout real), conteo sin cambios; luego `unpause validator` | No |
 
 Cada corrida escribe **exactamente un documento**. Las consultas internas a Persistence se hacen desde el contenedor del Orchestrator con `docker compose exec`, sin publicar puertos.
 
@@ -358,5 +359,5 @@ docker compose -f docker-compose.integration.yml down       # conserva el volume
 
 ## Pendiente
 
-- **Ejecutar la integración en una máquina con Docker**: `config`, el build de `validator` (contextos Git por SHA) y la prueba de humo. Si el contexto Git por SHA no funciona, usar fuentes locales verificadas por SHA (`*_CONTEXT`).
-- **Confirmar el timeout** de 10 s con el sistema real.
+- ~~**Ejecutar la integración en una máquina con Docker**~~ (completado): se levantó el entorno de `docker-compose.integration.yml` y las 10 pruebas E2E pasaron.
+- ~~**Confirmar el timeout** de 10 s con el sistema real~~ (completado): `test_con_validator_pausado_responde_504_al_vencer_el_timeout_sin_escribir` verificó contra el stack real que, con el Validator sin responder, el Orchestrator devuelve `504` entre 10 y 15 s sin escribir en MongoDB. No se midieron PDFs más pesados (ver [Timeout](#timeout)).
