@@ -2,11 +2,10 @@
 
 import httpx
 
-from app.adapters.http import errores_de_transporte, leer_problema, no_disponible
+from app.adapters.http import archivo_pdf, errores_de_transporte, leer_problema, no_disponible, rechazo_del_archivo
 from app.exceptions import ArchivoRechazadoError, ValidacionFallidaError
 
 SERVICIO = "Validator"
-PDF_MIME_TYPE = "application/pdf"
 
 # Rechazos del archivo que se propagan al cliente. /errors/bad-request no está: indica
 # un request mal armado por el Orchestrator, no un problema del archivo.
@@ -25,9 +24,7 @@ class HttpValidator:
 
     async def validar(self, nombre_archivo: str, contenido: bytes) -> None:
         with errores_de_transporte(SERVICIO):
-            respuesta = await self._cliente.post(
-                "/validate", files={"file": (nombre_archivo, contenido, PDF_MIME_TYPE)}
-            )
+            respuesta = await self._cliente.post("/validate", files=archivo_pdf(nombre_archivo, contenido))
 
         if respuesta.status_code == 200:
             return
@@ -42,7 +39,7 @@ def _rechazo(respuesta: httpx.Response) -> ArchivoRechazadoError | None:
     if respuesta.status_code not in STATUS_DE_RECHAZO or problema is None:
         return None
 
-    type_, title, detail = problema.get("type"), problema.get("title"), problema.get("detail")
-    if not all(isinstance(campo, str) for campo in (type_, title, detail)) or type_ not in TIPOS_DE_RECHAZO:
+    type_ = problema.get("type")
+    if not isinstance(type_, str) or type_ not in TIPOS_DE_RECHAZO:
         return None
-    return ArchivoRechazadoError(respuesta.status_code, type_, title, detail)
+    return rechazo_del_archivo(respuesta.status_code, type_, problema)

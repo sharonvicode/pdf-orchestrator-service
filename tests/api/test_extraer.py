@@ -126,6 +126,34 @@ def test_extraer_error_de_comunicacion_devuelve_problem_json(client, usar_fakes,
     assert body["status"] == status
     assert body["detail"] == "El Extractor no respondió."
     assert body["instance"] == "/extraer"
+    assert "retry-after" not in response.headers
+
+
+def test_extraer_servicio_no_disponible_propaga_retry_after(client, usar_fakes):
+    usar_fakes(extractor=ServicioQueFalla(ServicioNoDisponibleError("El Extractor está saturado.", retry_after="1")))
+
+    response = client.post("/extraer", files={"file": PDF})
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
+
+
+def test_extraer_rechazo_del_extractor_conserva_status_title_y_detail(client, usar_fakes, fakes):
+    rechazo = ArchivoRechazadoError(422, "about:blank", "Contenido no procesable", "El PDF no tiene texto extraíble.")
+    usar_fakes(extractor=ServicioQueFalla(rechazo))
+
+    response = client.post("/extraer", files={"file": PDF})
+
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith(PROBLEM_JSON)
+    assert response.json() == {
+        "type": "about:blank",
+        "title": "Contenido no procesable",
+        "status": 422,
+        "detail": "El PDF no tiene texto extraíble.",
+        "instance": "/extraer",
+    }
+    assert fakes[2].llamadas == []
 
 
 def test_extraer_error_de_comunicacion_no_expone_la_causa_interna(client, usar_fakes):
@@ -140,27 +168,48 @@ def test_extraer_error_de_comunicacion_no_expone_la_causa_interna(client, usar_f
     assert "ConnectionError" not in response.text
 
 
-def test_extraer_sin_overrides_valida_con_el_validator_http(app, client):
-    recibidos = []
+@pytest.fixture
+def servicios_http(app):
+    """Usa la composición real con clientes HTTP simulados; responde según el path pedido."""
+    recibidos: list[str] = []
 
-    def validator(request: httpx.Request) -> httpx.Response:
-        recibidos.append(request.url.path)
-        cuerpo = {
-            "type": "/errors/unsupported-file-type",
-            "title": "Tipo de archivo no soportado",
-            "status": 415,
-            "detail": "El archivo debe tener extensión .pdf.",
-            "instance": "/validate",
-        }
-        return httpx.Response(415, json=cuerpo, headers={"content-type": PROBLEM_JSON})
+    def _simular(**respuestas: httpx.Response):
+        def manejar(request: httpx.Request) -> httpx.Response:
+            recibidos.append(request.url.path)
+            return respuestas[request.url.path.strip("/").replace("/", "_")]
 
-    cliente = httpx.AsyncClient(base_url="http://validator.example/", transport=httpx.MockTransport(validator))
-    app.dependency_overrides[get_clientes] = lambda: ClientesHttp(cliente, cliente, cliente)
+        cliente = httpx.AsyncClient(base_url="http://servicio.example/", transport=httpx.MockTransport(manejar))
+        app.dependency_overrides[get_clientes] = lambda: ClientesHttp(cliente, cliente, cliente)
+        return recibidos
+
+    yield _simular
+    app.dependency_overrides.clear()
+
+
+def test_extraer_sin_overrides_valida_con_el_validator_http(client, servicios_http):
+    cuerpo = {
+        "type": "/errors/unsupported-file-type",
+        "title": "Tipo de archivo no soportado",
+        "status": 415,
+        "detail": "El archivo debe tener extensión .pdf.",
+        "instance": "/validate",
+    }
+    recibidos = servicios_http(validate=httpx.Response(415, json=cuerpo, headers={"content-type": PROBLEM_JSON}))
 
     response = client.post("/extraer", files={"file": ("notas.txt", b"hola", "text/plain")})
 
-    app.dependency_overrides.clear()
     assert recibidos == ["/validate"]
     assert response.status_code == 415
     assert response.json()["type"] == "/errors/unsupported-file-type"
     assert response.json()["detail"] == "El archivo debe tener extensión .pdf."
+
+
+def test_extraer_sin_overrides_extrae_con_el_extractor_http(client, servicios_http):
+    exito = {"texto": "texto real", "metadatos": {"nombre_archivo": "documento.pdf", "cantidad_paginas": 3}}
+    recibidos = servicios_http(validate=httpx.Response(200), api_v1_extraer=httpx.Response(200, json=exito))
+
+    response = client.post("/extraer", files={"file": PDF})
+
+    assert recibidos == ["/validate", "/api/v1/extraer"]
+    assert response.status_code == 200
+    assert response.json()["texto"] == "texto real"

@@ -5,7 +5,14 @@ de cada servicio. Cualquier implementación puede además lanzar ServicioNoDispo
 o TiempoAgotadoError.
 """
 
+from dataclasses import dataclass
 from typing import Protocol
+
+
+@dataclass(frozen=True)
+class TextoExtraido:
+    texto: str
+    cantidad_paginas: int
 
 
 class Validator(Protocol):
@@ -15,8 +22,11 @@ class Validator(Protocol):
 
 
 class Extractor(Protocol):
-    async def extraer(self, nombre_archivo: str, contenido: bytes) -> str:
-        """Devuelve el texto del PDF o lanza ExtraccionFallidaError."""
+    async def extraer(self, nombre_archivo: str, contenido: bytes) -> TextoExtraido:
+        """Devuelve el texto y las páginas del PDF.
+
+        Lanza ArchivoRechazadoError si el archivo no se puede procesar, o ExtraccionFallidaError si falla.
+        """
         ...
 
 

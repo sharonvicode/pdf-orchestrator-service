@@ -19,6 +19,6 @@ class OrchestratorService:
 
     async def procesar(self, nombre_archivo: str, contenido: bytes) -> ResultadoExtraccion:
         await self._validator.validar(nombre_archivo, contenido)
-        texto = await self._extractor.extraer(nombre_archivo, contenido)
-        await self._persistence.guardar(nombre_archivo, texto)
-        return ResultadoExtraccion(nombre_archivo=nombre_archivo, texto=texto)
+        extraido = await self._extractor.extraer(nombre_archivo, contenido)
+        await self._persistence.guardar(nombre_archivo, extraido.texto)
+        return ResultadoExtraccion(nombre_archivo=nombre_archivo, texto=extraido.texto)

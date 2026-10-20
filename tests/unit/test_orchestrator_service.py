@@ -112,7 +112,7 @@ async def test_flujo_exitoso_extrae_y_persiste_el_texto():
 
 
 async def test_flujo_exitoso_devuelve_texto_y_nombre_archivo():
-    servicio, *_ = crear_servicio(extractor=FakeExtractor(texto="hola mundo"))
+    servicio, *_ = crear_servicio(extractor=FakeExtractor(texto="hola mundo", cantidad_paginas=3))
 
     resultado = await servicio.procesar(NOMBRE, CONTENIDO)
 

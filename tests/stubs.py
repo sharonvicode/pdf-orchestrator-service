@@ -1,5 +1,7 @@
 """Dobles de prueba que no forman parte de los fakes de la aplicación."""
 
+from app.ports import TextoExtraido
+
 
 class ServicioQueRegistra:
     """Cumple los tres ports con éxito y anota su nombre en un registro compartido."""
@@ -13,7 +15,7 @@ class ServicioQueRegistra:
 
     async def extraer(self, *_):
         self._registro.append(self._nombre)
-        return "texto"
+        return TextoExtraido(texto="texto", cantidad_paginas=1)
 
     async def guardar(self, *_):
         self._registro.append(self._nombre)

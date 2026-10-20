@@ -53,7 +53,7 @@ Si un paso falla, los siguientes no se ejecutan. Traducir fallos de comunicació
 
 ### Sobre los fakes actuales
 
-`app/dependencies.py` conecta el **adapter HTTP del Validator** (`app/adapters/validator.py`) y, por ahora, **fakes** (`app/adapters/fakes.py`) para Extractor y Persistence:
+`app/dependencies.py` conecta los **adapters HTTP del Validator y del Extractor** (`app/adapters/validator.py`, `app/adapters/extractor.py`) y, por ahora, un **fake** (`app/adapters/fakes.py`) para Persistence:
 
 - existen solo para desarrollo y tests;
 - **no representan la integración real** con los otros servicios (el fake del Extractor siempre devuelve un texto fijo);
@@ -75,6 +75,7 @@ Si un paso falla, los siguientes no se ejecutan. Traducir fallos de comunicació
 │   ├── adapters/
 │   │   ├── http.py             # Clientes HTTP compartidos y errores de transporte
 │   │   ├── validator.py        # Adapter HTTP del Validator
+│   │   ├── extractor.py        # Adapter HTTP del Extractor
 │   │   └── fakes.py            # Fakes para desarrollo y tests
 │   └── services/
 │       └── orchestrator.py     # Caso de uso OrchestratorService
@@ -135,10 +136,11 @@ Los errores de validación del request incluyen además una lista `errors` con `
 |------|-----------|------------------|
 | 422 | Request inválido (por ejemplo, falta `file`) | — (validación de FastAPI) |
 | 400 / 413 / 415 / 422 | El Validator rechazó el archivo (se conservan su `status`, `type`, `title` y `detail`) | `ArchivoRechazadoError` |
+| 413 / 422 | El Extractor rechazó el archivo (se conservan su `status`, `title` y `detail`, con `type` `about:blank`) | `ArchivoRechazadoError` |
 | 502 | El Validator respondió fuera de contrato | `ValidacionFallidaError` |
-| 502 | Falló la extracción de texto | `ExtraccionFallidaError` |
+| 502 | El Extractor respondió fuera de contrato | `ExtraccionFallidaError` |
 | 502 | Falló la persistencia | `PersistenciaFallidaError` |
-| 503 | Un servicio downstream no está disponible | `ServicioNoDisponibleError` |
+| 503 | Un servicio downstream no está disponible (con `Retry-After` si el Extractor lo envía) | `ServicioNoDisponibleError` |
 | 504 | Un servicio downstream no respondió a tiempo | `TiempoAgotadoError` |
 | 404 / 405 | Ruta o método inexistente | — |
 | 500 | Error inesperado | — |
@@ -154,7 +156,7 @@ Los errores de validación del request incluyen además una lista `errors` con `
 | Servicio | Estado |
 |----------|--------|
 | Validator | Confirmado (rama `feat/http-contract`) e implementado, ver abajo |
-| Extractor | **CONTRATO PENDIENTE DE ACUERDO CON EL EQUIPO** |
+| Extractor | Confirmado e implementado, ver abajo |
 | Persistence | **CONTRATO PENDIENTE DE ACUERDO CON EL EQUIPO** |
 
 Decisiones pendientes que dependen de ese acuerdo:
@@ -172,7 +174,7 @@ Son las firmas Python que usa el caso de uso. **No son contratos HTTP** y pueden
 | Port | Firma | En caso de fallo |
 |------|-------|------------------|
 | `Validator` | `validar(nombre_archivo: str, contenido: bytes) -> None` | `ArchivoRechazadoError`, `ValidacionFallidaError` |
-| `Extractor` | `extraer(nombre_archivo: str, contenido: bytes) -> str` | `ExtraccionFallidaError` |
+| `Extractor` | `extraer(nombre_archivo: str, contenido: bytes) -> TextoExtraido(texto, cantidad_paginas)` | `ArchivoRechazadoError`, `ExtraccionFallidaError` |
 | `Persistence` | `guardar(nombre_archivo: str, texto: str) -> None` | `PersistenciaFallidaError` |
 
 Cualquier port puede además lanzar `ServicioNoDisponibleError` o `TiempoAgotadoError`.
@@ -189,6 +191,19 @@ Cualquier port puede además lanzar `ServicioNoDisponibleError` o `TiempoAgotado
 | `503` | `503` servicio no disponible |
 | Timeout / fallo de conexión | `504` / `503` |
 | Cualquier otra respuesta (5xx, 404, cuerpo fuera de contrato) | `502` `ValidacionFallidaError` |
+
+### Extractor (`app/adapters/extractor.py`)
+
+`POST /api/v1/extraer` con el archivo en el campo multipart `file`, con Content-Type `application/pdf`. Del cuerpo de éxito solo se usan `texto` y `metadatos.cantidad_paginas`; los demás metadatos se toleran pero no se exigen.
+
+| Respuesta del Extractor | Resultado en el Orchestrator |
+|-------------------------|------------------------------|
+| `200` con `texto` (texto) y `metadatos.cantidad_paginas` (entero ≥ 0) | Sigue el flujo |
+| `413` / `422` `application/problem+json` con `title`/`detail` de texto | Se propaga al cliente con el mismo `status`, `title` y `detail`, y `type` `about:blank` |
+| `422` con la extensión `errors` | `502`: es la validación del request del Extractor, el Orchestrator lo armó mal |
+| `503` | `503` servicio no disponible; se propaga `Retry-After` si viene |
+| Timeout / fallo de conexión | `504` / `503` |
+| Cualquier otra respuesta, o `200` fuera de contrato | `502` `ExtraccionFallidaError` con mensaje fijo |
 
 ## Configuración
 
