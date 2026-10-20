@@ -41,7 +41,7 @@ Si un paso falla, los siguientes no se ejecutan. Traducir fallos de comunicació
 
 - **Ports** (`app/ports.py`): interfaces (`Protocol`) de Validator, Extractor y Persistence.
 - **Caso de uso** (`app/services/orchestrator.py`): `OrchestratorService` coordina el flujo y depende únicamente de los ports.
-- **Adapters** (`app/adapters/`): implementaciones concretas de los ports.
+- **Adapters** (`app/adapters/`): implementaciones concretas de los ports. `http.py` reúne lo común a los adapters HTTP (clientes compartidos, errores de transporte, lectura de problemas RFC 9457).
 - **Presentación** (`app/routes.py`): endpoints FastAPI que delegan en el caso de uso.
 
 ¿Por qué es apropiada?
@@ -53,7 +53,7 @@ Si un paso falla, los siguientes no se ejecutan. Traducir fallos de comunicació
 
 ### Sobre los fakes actuales
 
-`app/dependencies.py` conecta hoy **fakes** (`app/adapters/fakes.py`) como implementación por defecto:
+`app/dependencies.py` conecta el **adapter HTTP del Validator** (`app/adapters/validator.py`) y, por ahora, **fakes** (`app/adapters/fakes.py`) para Extractor y Persistence:
 
 - existen solo para desarrollo y tests;
 - **no representan la integración real** con los otros servicios (el fake del Extractor siempre devuelve un texto fijo);
@@ -73,6 +73,8 @@ Si un paso falla, los siguientes no se ejecutan. Traducir fallos de comunicació
 │   ├── routes.py               # Endpoints HTTP
 │   ├── schemas.py              # DTOs públicos
 │   ├── adapters/
+│   │   ├── http.py             # Clientes HTTP compartidos y errores de transporte
+│   │   ├── validator.py        # Adapter HTTP del Validator
 │   │   └── fakes.py            # Fakes para desarrollo y tests
 │   └── services/
 │       └── orchestrator.py     # Caso de uso OrchestratorService
@@ -120,9 +122,9 @@ Todos los errores se devuelven con `Content-Type: application/problem+json`:
 ```json
 {
   "type": "about:blank",
-  "title": "PDF inválido",
-  "status": 422,
-  "detail": "El archivo no es un PDF válido.",
+  "title": "Servicio no disponible",
+  "status": 503,
+  "detail": "El servicio Validator no está disponible.",
   "instance": "/extraer"
 }
 ```
@@ -132,7 +134,8 @@ Los errores de validación del request incluyen además una lista `errors` con `
 | HTTP | Situación | Error de dominio |
 |------|-----------|------------------|
 | 422 | Request inválido (por ejemplo, falta `file`) | — (validación de FastAPI) |
-| 422 | El Validator rechazó el archivo | `PdfInvalidoError` |
+| 400 / 413 / 415 / 422 | El Validator rechazó el archivo (se conservan su `status`, `type`, `title` y `detail`) | `ArchivoRechazadoError` |
+| 502 | El Validator respondió fuera de contrato | `ValidacionFallidaError` |
 | 502 | Falló la extracción de texto | `ExtraccionFallidaError` |
 | 502 | Falló la persistencia | `PersistenciaFallidaError` |
 | 503 | Un servicio downstream no está disponible | `ServicioNoDisponibleError` |
@@ -150,7 +153,7 @@ Los errores de validación del request incluyen además una lista `errors` con `
 
 | Servicio | Estado |
 |----------|--------|
-| Validator | **CONTRATO PENDIENTE DE ACUERDO CON EL EQUIPO** |
+| Validator | Confirmado (rama `feat/http-contract`) e implementado, ver abajo |
 | Extractor | **CONTRATO PENDIENTE DE ACUERDO CON EL EQUIPO** |
 | Persistence | **CONTRATO PENDIENTE DE ACUERDO CON EL EQUIPO** |
 
@@ -168,11 +171,24 @@ Son las firmas Python que usa el caso de uso. **No son contratos HTTP** y pueden
 
 | Port | Firma | En caso de fallo |
 |------|-------|------------------|
-| `Validator` | `validar(nombre_archivo: str, contenido: bytes) -> ResultadoValidacion(es_valido, motivo)` | — |
+| `Validator` | `validar(nombre_archivo: str, contenido: bytes) -> None` | `ArchivoRechazadoError`, `ValidacionFallidaError` |
 | `Extractor` | `extraer(nombre_archivo: str, contenido: bytes) -> str` | `ExtraccionFallidaError` |
 | `Persistence` | `guardar(nombre_archivo: str, texto: str) -> None` | `PersistenciaFallidaError` |
 
 Cualquier port puede además lanzar `ServicioNoDisponibleError` o `TiempoAgotadoError`.
+
+### Validator (`app/adapters/validator.py`)
+
+`POST /validate` con el archivo en el campo multipart `file`, siempre con Content-Type `application/pdf`.
+
+| Respuesta del Validator | Resultado en el Orchestrator |
+|-------------------------|------------------------------|
+| `200` | Archivo válido; no se depende del cuerpo |
+| `400` / `413` / `415` / `422` `application/problem+json` con `type` `/errors/empty-file`, `/errors/file-too-large`, `/errors/unsupported-file-type` o `/errors/invalid-pdf`, y `title`/`detail` de texto | Se propaga al cliente con el mismo `status`, `type`, `title` y `detail` |
+| `400` `/errors/bad-request` | `502`: el Orchestrator armó mal el request; no es culpa del cliente |
+| `503` | `503` servicio no disponible |
+| Timeout / fallo de conexión | `504` / `503` |
+| Cualquier otra respuesta (5xx, 404, cuerpo fuera de contrato) | `502` `ValidacionFallidaError` |
 
 ## Configuración
 
@@ -213,7 +229,7 @@ uv run pytest tests/api          # endpoints y RFC 9457
 uv run ruff check .              # lint
 ```
 
-Los tests no levantan otros servicios: usan los fakes de `app/adapters/fakes.py` y los dobles de `tests/stubs.py`. No hay tests de adapters HTTP porque esos adapters todavía no existen.
+Los tests no levantan otros servicios: usan los fakes de `app/adapters/fakes.py`, los dobles de `tests/stubs.py` y, para los adapters HTTP, `httpx.MockTransport` (incluido en httpx, sin dependencias extra).
 
 ## Docker
 

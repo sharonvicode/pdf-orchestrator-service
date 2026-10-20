@@ -3,6 +3,7 @@
 
 class OrchestratorError(Exception):
     status_code: int = 500
+    type: str = "about:blank"
     title: str = "Error del Orchestrator"
 
     def __init__(self, detail: str):
@@ -10,9 +11,21 @@ class OrchestratorError(Exception):
         self.detail = detail
 
 
-class PdfInvalidoError(OrchestratorError):
-    status_code = 422
-    title = "PDF inválido"
+class ArchivoRechazadoError(OrchestratorError):
+    """Un servicio rechazó el archivo del cliente. Conserva el problema RFC 9457 original."""
+
+    def __init__(self, status_code: int, type_: str, title: str, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.type = type_
+        self.title = title
+
+
+class ValidacionFallidaError(OrchestratorError):
+    """El Validator respondió fuera de contrato."""
+
+    status_code = 502
+    title = "Falló la validación del archivo"
 
 
 class ExtraccionFallidaError(OrchestratorError):

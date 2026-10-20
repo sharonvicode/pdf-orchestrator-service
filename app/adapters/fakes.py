@@ -4,18 +4,18 @@ Se usan como implementación por defecto hasta que existan los clientes HTTP rea
 y en los tests. Registran las llamadas recibidas.
 """
 
-from app.exceptions import ExtraccionFallidaError, PersistenciaFallidaError
-from app.ports import ResultadoValidacion
+from app.exceptions import ArchivoRechazadoError, ExtraccionFallidaError, PersistenciaFallidaError
 
 
 class FakeValidator:
-    def __init__(self, es_valido: bool = True, motivo: str | None = None):
-        self._resultado = ResultadoValidacion(es_valido=es_valido, motivo=motivo)
+    def __init__(self, rechazo: ArchivoRechazadoError | None = None):
+        self._rechazo = rechazo
         self.llamadas: list[tuple[str, bytes]] = []
 
-    async def validar(self, nombre_archivo: str, contenido: bytes) -> ResultadoValidacion:
+    async def validar(self, nombre_archivo: str, contenido: bytes) -> None:
         self.llamadas.append((nombre_archivo, contenido))
-        return self._resultado
+        if self._rechazo:
+            raise self._rechazo
 
 
 class FakeExtractor:

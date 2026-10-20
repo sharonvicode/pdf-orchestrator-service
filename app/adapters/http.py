@@ -3,11 +3,13 @@
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
 from app.config import Settings
 from app.exceptions import ServicioNoDisponibleError, TiempoAgotadoError
+from app.problem_details import PROBLEM_JSON
 
 
 @dataclass(frozen=True)
@@ -27,6 +29,17 @@ async def abrir_clientes(settings: Settings) -> AsyncIterator[ClientesHttp]:
         httpx.AsyncClient(base_url=str(settings.persistence_url), timeout=timeout) as persistence,
     ):
         yield ClientesHttp(validator=validator, extractor=extractor, persistence=persistence)
+
+
+def leer_problema(respuesta: httpx.Response) -> dict[str, Any] | None:
+    """Devuelve el cuerpo RFC 9457 de la respuesta, o None si no es un objeto application/problem+json."""
+    if not respuesta.headers.get("content-type", "").startswith(PROBLEM_JSON):
+        return None
+    try:
+        cuerpo = respuesta.json()
+    except ValueError:
+        return None
+    return cuerpo if isinstance(cuerpo, dict) else None
 
 
 def no_disponible(servicio: str) -> ServicioNoDisponibleError:
