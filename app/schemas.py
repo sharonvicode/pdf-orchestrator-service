@@ -9,5 +9,6 @@ class HealthResponse(BaseModel):
 
 class ExtraccionResponse(BaseModel):
     exito: bool
+    id: str
     texto: str
     nombre_archivo: str

@@ -15,6 +15,7 @@ pytestmark = pytest.mark.anyio
 
 NOMBRE = "documento.pdf"
 CONTENIDO = b"%PDF-1.7 contenido"
+ID = "6f1c2a9e-8f0e-4b8e-9a51-2b7c3d4e5f60"
 RECHAZO = ArchivoRechazadoError(415, "/errors/unsupported-file-type", "Tipo de archivo no soportado", "No es un PDF")
 
 
@@ -102,18 +103,22 @@ async def test_si_validator_no_disponible_no_llama_extractor_ni_persistence():
     assert persistence.llamadas == []
 
 
-async def test_flujo_exitoso_extrae_y_persiste_el_texto():
-    servicio, _, extractor, persistence = crear_servicio(extractor=FakeExtractor(texto="hola mundo"))
+async def test_flujo_exitoso_persiste_texto_y_cantidad_de_paginas_del_extractor():
+    servicio, _, extractor, persistence = crear_servicio(
+        extractor=FakeExtractor(texto="hola mundo", cantidad_paginas=3)
+    )
 
     await servicio.procesar(NOMBRE, CONTENIDO)
 
     assert extractor.llamadas == [(NOMBRE, CONTENIDO)]
-    assert persistence.llamadas == [(NOMBRE, "hola mundo")]
+    assert persistence.llamadas == [(NOMBRE, "hola mundo", 3)]
 
 
-async def test_flujo_exitoso_devuelve_texto_y_nombre_archivo():
-    servicio, *_ = crear_servicio(extractor=FakeExtractor(texto="hola mundo", cantidad_paginas=3))
+async def test_flujo_exitoso_devuelve_id_de_persistence_texto_y_nombre_archivo():
+    servicio, *_ = crear_servicio(
+        extractor=FakeExtractor(texto="hola mundo", cantidad_paginas=3), persistence=FakePersistence(id=ID)
+    )
 
     resultado = await servicio.procesar(NOMBRE, CONTENIDO)
 
-    assert resultado == ResultadoExtraccion(nombre_archivo=NOMBRE, texto="hola mundo")
+    assert resultado == ResultadoExtraccion(id=ID, nombre_archivo=NOMBRE, texto="hola mundo")

@@ -25,4 +25,6 @@ async def extraer(
     """Recibe el archivo y delega todo el flujo en el OrchestratorService."""
     contenido = await file.read()
     resultado = await servicio.procesar(file.filename or "", contenido)
-    return ExtraccionResponse(exito=True, texto=resultado.texto, nombre_archivo=resultado.nombre_archivo)
+    return ExtraccionResponse(
+        exito=True, id=resultado.id, texto=resultado.texto, nombre_archivo=resultado.nombre_archivo
+    )

@@ -1,7 +1,6 @@
-"""Adaptadores falsos de Validator, Extractor y Persistence.
+"""Adaptadores falsos de Validator, Extractor y Persistence, para los tests.
 
-Se usan como implementación por defecto hasta que existan los clientes HTTP reales,
-y en los tests. Registran las llamadas recibidas.
+No forman parte de la composición por defecto. Registran las llamadas recibidas.
 """
 
 from app.exceptions import ArchivoRechazadoError, ExtraccionFallidaError, PersistenciaFallidaError
@@ -33,11 +32,13 @@ class FakeExtractor:
 
 
 class FakePersistence:
-    def __init__(self, falla: bool = False):
+    def __init__(self, id: str = "id-falso", falla: bool = False):
+        self._id = id
         self._falla = falla
-        self.llamadas: list[tuple[str, str]] = []
+        self.llamadas: list[tuple[str, str, int]] = []
 
-    async def guardar(self, nombre_archivo: str, texto: str) -> None:
-        self.llamadas.append((nombre_archivo, texto))
+    async def guardar(self, nombre_archivo: str, texto: str, cantidad_paginas: int) -> str:
+        self.llamadas.append((nombre_archivo, texto, cantidad_paginas))
         if self._falla:
             raise PersistenciaFallidaError("Persistence no pudo guardar el texto.")
+        return self._id

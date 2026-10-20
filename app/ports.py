@@ -31,6 +31,6 @@ class Extractor(Protocol):
 
 
 class Persistence(Protocol):
-    async def guardar(self, nombre_archivo: str, texto: str) -> None:
-        """Persiste el texto o lanza PersistenciaFallidaError."""
+    async def guardar(self, nombre_archivo: str, texto: str, cantidad_paginas: int) -> str:
+        """Persiste la extracción y devuelve el id generado, o lanza PersistenciaFallidaError."""
         ...

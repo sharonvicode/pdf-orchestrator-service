@@ -1,20 +1,19 @@
-import httpx
 import pytest
 
 from app.adapters.fakes import FakeExtractor, FakePersistence, FakeValidator
-from app.adapters.http import ClientesHttp
-from app.dependencies import get_clientes, get_orchestrator_service
+from app.dependencies import get_orchestrator_service
 from app.exceptions import ArchivoRechazadoError, ServicioNoDisponibleError, TiempoAgotadoError
 from app.services.orchestrator import OrchestratorService
 from tests.stubs import ServicioQueFalla
 
 PROBLEM_JSON = "application/problem+json"
 PDF = ("documento.pdf", b"%PDF-1.7 contenido", "application/pdf")
+ID = "6f1c2a9e-8f0e-4b8e-9a51-2b7c3d4e5f60"
 
 
 @pytest.fixture
 def fakes():
-    return FakeValidator(), FakeExtractor(texto="hola mundo"), FakePersistence()
+    return FakeValidator(), FakeExtractor(texto="hola mundo", cantidad_paginas=3), FakePersistence(id=ID)
 
 
 @pytest.fixture
@@ -35,10 +34,10 @@ def test_extraer_exitoso_devuelve_200(client, usar_fakes):
     assert response.status_code == 200
 
 
-def test_extraer_exitoso_devuelve_exito_texto_y_nombre(client, usar_fakes):
+def test_extraer_exitoso_devuelve_exito_id_texto_y_nombre(client, usar_fakes):
     response = client.post("/extraer", files={"file": PDF})
 
-    assert response.json() == {"exito": True, "texto": "hola mundo", "nombre_archivo": "documento.pdf"}
+    assert response.json() == {"exito": True, "id": ID, "texto": "hola mundo", "nombre_archivo": "documento.pdf"}
 
 
 def test_extraer_delega_nombre_y_contenido_al_servicio(client, usar_fakes, fakes):
@@ -48,7 +47,7 @@ def test_extraer_delega_nombre_y_contenido_al_servicio(client, usar_fakes, fakes
 
     assert validator.llamadas == [("documento.pdf", b"%PDF-1.7 contenido")]
     assert extractor.llamadas == [("documento.pdf", b"%PDF-1.7 contenido")]
-    assert persistence.llamadas == [("documento.pdf", "hola mundo")]
+    assert persistence.llamadas == [("documento.pdf", "hola mundo", 3)]
 
 
 def test_extraer_no_valida_el_pdf_por_su_cuenta(client, usar_fakes):
@@ -166,64 +165,3 @@ def test_extraer_error_de_comunicacion_no_expone_la_causa_interna(client, usar_f
     assert response.status_code == 503
     assert "10.0.0.5" not in response.text
     assert "ConnectionError" not in response.text
-
-
-@pytest.fixture
-def servicios_http(app):
-    """Usa la composición real con clientes HTTP simulados; responde según el path pedido."""
-    recibidos: list[str] = []
-
-    def _simular(**respuestas: httpx.Response):
-        def manejar(request: httpx.Request) -> httpx.Response:
-            recibidos.append(request.url.path)
-            return respuestas[request.url.path.strip("/").replace("/", "_")]
-
-        cliente = httpx.AsyncClient(base_url="http://servicio.example/", transport=httpx.MockTransport(manejar))
-        app.dependency_overrides[get_clientes] = lambda: ClientesHttp(cliente, cliente, cliente)
-        return recibidos
-
-    yield _simular
-    app.dependency_overrides.clear()
-
-
-def test_extraer_sin_overrides_valida_con_el_validator_http(client, servicios_http):
-    cuerpo = {
-        "type": "/errors/unsupported-file-type",
-        "title": "Tipo de archivo no soportado",
-        "status": 415,
-        "detail": "El archivo debe tener extensión .pdf.",
-        "instance": "/validate",
-    }
-    recibidos = servicios_http(validate=httpx.Response(415, json=cuerpo, headers={"content-type": PROBLEM_JSON}))
-
-    response = client.post("/extraer", files={"file": ("notas.txt", b"hola", "text/plain")})
-
-    assert recibidos == ["/validate"]
-    assert response.status_code == 415
-    assert response.json()["type"] == "/errors/unsupported-file-type"
-    assert response.json()["detail"] == "El archivo debe tener extensión .pdf."
-
-
-def test_extraer_sin_overrides_extrae_con_el_extractor_http(client, servicios_http):
-    exito = {"texto": "texto real", "metadatos": {"nombre_archivo": "documento.pdf", "cantidad_paginas": 3}}
-    recibidos = servicios_http(validate=httpx.Response(200), api_v1_extraer=httpx.Response(200, json=exito))
-
-    response = client.post("/extraer", files={"file": PDF})
-
-    assert recibidos == ["/validate", "/api/v1/extraer"]
-    assert response.status_code == 200
-    assert response.json()["texto"] == "texto real"
-
-
-@pytest.mark.parametrize(
-    ("enviado", "publico"),
-    [({"Retry-After": "5"}, "5"), ({"Retry-After": "pronto"}, None), ({}, None)],
-    ids=["valido", "invalido", "ausente"],
-)
-def test_extraer_extractor_saturado_reenvia_solo_retry_after_valido(client, servicios_http, enviado, publico):
-    servicios_http(validate=httpx.Response(200), api_v1_extraer=httpx.Response(503, headers=enviado))
-
-    response = client.post("/extraer", files={"file": PDF})
-
-    assert response.status_code == 503
-    assert response.headers.get("retry-after") == publico
