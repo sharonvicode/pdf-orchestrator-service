@@ -28,7 +28,7 @@ El Orchestrator **solo coordina**:
 4. Pide a **Persistence** que guarde el nombre, el texto y la cantidad de páginas, y obtiene el `id` generado.
 5. Devuelve la respuesta al cliente, o un error en formato RFC 9457.
 
-Si un paso falla, los siguientes no se ejecutan. Traducir las respuestas y los fallos de comunicación de cada servicio a errores HTTP también es responsabilidad del Orchestrator. No hay reintentos automáticos: el alta en Persistence no es idempotente.
+Si un paso falla, los siguientes no se ejecutan. Traducir las respuestas y los fallos de comunicación de cada servicio a errores HTTP también es responsabilidad del Orchestrator. No hay reintentos automáticos (ver [Persistence](#persistence-appadapterspersistencepy)).
 
 ### Qué NO hace
 
@@ -151,7 +151,7 @@ Los errores de validación del request incluyen además una lista `errors` con `
 
 ## Contratos con los servicios
 
-Todos los archivos se envían en el campo multipart `file`, con el nombre original y Content-Type `application/pdf`.
+Al Validator y al Extractor el archivo se les envía en el campo multipart `file`, con el nombre original y Content-Type `application/pdf`.
 
 ### Validator (`app/adapters/validator.py`)
 
@@ -164,7 +164,7 @@ Todos los archivos se envían en el campo multipart `file`, con el nombre origin
 | `400` `/errors/bad-request` | `502`: el Orchestrator armó mal el request; no es culpa del cliente |
 | `503` | `503` servicio no disponible |
 | Timeout / fallo de conexión | `504` / `503` |
-| Cualquier otra respuesta (5xx, 404, cuerpo fuera de contrato) | `502` `ValidacionFallidaError` |
+| Cualquier otra respuesta (otro 5xx, 404, cuerpo fuera de contrato) | `502` `ValidacionFallidaError` con mensaje fijo |
 
 ### Extractor (`app/adapters/extractor.py`)
 
@@ -172,7 +172,7 @@ Todos los archivos se envían en el campo multipart `file`, con el nombre origin
 
 | Respuesta del Extractor | Resultado en el Orchestrator |
 |-------------------------|------------------------------|
-| `200` con `texto` (texto) y `metadatos.cantidad_paginas` (entero ≥ 0) | Sigue el flujo |
+| `200` con `texto` (string) y `metadatos.cantidad_paginas` (entero ≥ 0) | Sigue el flujo |
 | `413` `application/problem+json` con `title`/`detail` de texto | Se propaga con el mismo `status`, `title` y `detail`, y `type` `about:blank` |
 | `422` `application/problem+json` con `title`/`detail` de texto | Se propaga con el mismo `status` y `title`, `type` `about:blank` y un `detail` fijo: el original puede incluir mensajes internos de la biblioteca de PDF |
 | `422` con la extensión `errors` | `502`: es la validación del request del Extractor, el Orchestrator lo armó mal |
@@ -188,11 +188,11 @@ Persistence no garantiza RFC 9457: sus errores pueden ser JSON de FastAPI o text
 
 | Respuesta de Persistence | Resultado en el Orchestrator |
 |--------------------------|------------------------------|
-| `201` con `id` de texto no vacío | Se devuelve ese `id` al cliente |
+| `201` con `id` string no vacío; los campos adicionales se ignoran | Se devuelve ese `id` al cliente |
 | Timeout / fallo de conexión | `504` / `503` |
-| Cualquier otro status (incluido otro 2xx), cuerpo ilegible, `id` ausente, vacío o que no sea texto | `502` `PersistenciaFallidaError` con mensaje fijo |
+| Cualquier otro status (incluidos otros 2xx y `503`, que no están en su contrato), cuerpo ilegible, `id` ausente, vacío, en blanco o que no sea string | `502` `PersistenciaFallidaError` con mensaje fijo |
 
-No se reintenta: un segundo `POST` crearía otra extracción.
+**Sin reintentos.** El alta no es idempotente: un segundo `POST` crearía otra extracción. Si el timeout vence después de que Persistence guardó, el cliente recibe `504` aunque la extracción exista; **si el cliente reintenta, se crea un duplicado**. Un cliente que reintente tras un `504` debe asumir ese riesgo.
 
 ## Configuración
 
@@ -203,7 +203,7 @@ Se centraliza en `app/config.py` (`Settings`, basada en `pydantic-settings`). Se
 | `VALIDATOR_URL` | Sí | — | URL base del Validator |
 | `EXTRACTOR_URL` | Sí | — | URL base del Extractor |
 | `PERSISTENCE_URL` | Sí | — | URL base de Persistence |
-| `HTTP_TIMEOUT_SECONDS` | No | `10` | Timeout de httpx por llamada a un servicio (> 0) |
+| `HTTP_TIMEOUT_SECONDS` | No | `10` | Timeout de httpx por fase de cada llamada a un servicio, en segundos (> 0) |
 | `LOG_LEVEL` | No | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` o `CRITICAL` |
 | `PORT` | No | `8000` | Puerto del Orchestrator |
 
@@ -222,7 +222,7 @@ Se mantiene en **10 s**, según lo medido en el Extractor (README y `TASK/tp-tes
 - Cada proceso del Extractor extrae de a uno y encola hasta 20 pedidos; con la cola llena responde `503` al instante. Una cola llena de PDFs como esos se vacía en ~3 s, dentro del timeout.
 - Bajo sobrecarga sostenida (50 req/s) la mediana llegó a ~14.7 s. Ahí subir el timeout no ayuda: el pedido sigue esperando en una cola saturada, y el `504` libera antes al cliente.
 
-Revisar el valor con las pruebas de punta a punta (PDFs más pesados por CPU, como uno de 300 páginas, no tienen medición individual). Si se agota el timeout, el servicio puede terminar el trabajo igual: en particular, Persistence puede haber guardado la extracción aunque el cliente reciba `504`.
+Revisar el valor con las pruebas de punta a punta (PDFs más pesados por CPU, como uno de 300 páginas, no tienen medición individual). Un servicio puede terminar su trabajo aunque el Orchestrator ya haya respondido `504`; para Persistence eso implica el riesgo de duplicados descrito en su contrato.
 
 ## Desarrollo
 

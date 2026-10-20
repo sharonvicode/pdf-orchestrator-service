@@ -45,6 +45,12 @@ async def test_201_devuelve_el_id_generado():
     assert await persistence.guardar(NOMBRE, TEXTO, 3) == ID
 
 
+async def test_201_ignora_campos_adicionales():
+    persistence = persistence_que_responde(httpx.Response(201, json={"id": ID, "file_name": NOMBRE, "extra": 1}))
+
+    assert await persistence.guardar(NOMBRE, TEXTO, 3) == ID
+
+
 @pytest.mark.parametrize(
     "respuesta",
     [
