@@ -43,7 +43,7 @@ def test_ruta_inexistente_incluye_campos_rfc9457(client):
 
 
 def test_metodo_no_permitido_devuelve_problem_json(client):
-    response = client.post("/health/")
+    response = client.post("/health")
 
     assert response.status_code == 405
     assert response.headers["content-type"].startswith(PROBLEM_JSON)
