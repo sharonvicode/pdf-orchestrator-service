@@ -7,6 +7,7 @@ from app.ports import Extractor, Persistence, Validator
 
 @dataclass(frozen=True)
 class ResultadoExtraccion:
+    id: str
     nombre_archivo: str
     texto: str
 
@@ -20,5 +21,5 @@ class OrchestratorService:
     async def procesar(self, nombre_archivo: str, contenido: bytes) -> ResultadoExtraccion:
         await self._validator.validar(nombre_archivo, contenido)
         extraido = await self._extractor.extraer(nombre_archivo, contenido)
-        await self._persistence.guardar(nombre_archivo, extraido.texto)
-        return ResultadoExtraccion(nombre_archivo=nombre_archivo, texto=extraido.texto)
+        id_ = await self._persistence.guardar(nombre_archivo, extraido.texto, extraido.cantidad_paginas)
+        return ResultadoExtraccion(id=id_, nombre_archivo=nombre_archivo, texto=extraido.texto)

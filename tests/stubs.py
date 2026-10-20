@@ -19,6 +19,7 @@ class ServicioQueRegistra:
 
     async def guardar(self, *_):
         self._registro.append(self._nombre)
+        return "id"
 
 
 class ServicioQueFalla:
