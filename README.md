@@ -80,9 +80,11 @@ Cualquier port puede además lanzar `ServicioNoDisponibleError` o `TiempoAgotado
 ├── tests/
 │   ├── api/                    # Endpoints, RFC 9457 y flujo HTTP completo (TestClient)
 │   ├── unit/                   # Caso de uso, adapters, configuración y entrypoint
+│   ├── e2e/                    # Prueba de humo contra el stack de integración (Docker)
 │   └── stubs.py                # Dobles de prueba auxiliares
 ├── Dockerfile
 ├── docker-compose.yml          # Solo el Orchestrator (ver sección Docker)
+├── docker-compose.integration.yml  # Sistema completo con Traefik y MongoDB
 ├── .dockerignore
 ├── .env.example
 └── pyproject.toml
@@ -245,10 +247,12 @@ uv run ruff check .              # lint
 uv run ruff format --check .     # formato
 ```
 
-Los tests no levantan otros servicios:
+Los tests de `tests/unit` y `tests/api` no levantan otros servicios:
 
 - el caso de uso y los endpoints se prueban con los fakes de `app/adapters/fakes.py` y los dobles de `tests/stubs.py`;
 - los adapters y el flujo completo (`tests/api/test_flujo_http.py`) usan `httpx.MockTransport`, incluido en httpx, para simular las respuestas de cada servicio y verificar los requests, el orden de las llamadas y la ausencia de reintentos.
+
+`tests/e2e` es la prueba de humo contra el sistema real (ver [Integración con Docker Compose](#integración-con-docker-compose)); sin sus variables de entorno se salta.
 
 ## Docker
 
@@ -264,9 +268,96 @@ docker build -t pdf-orchestrator .
 docker run --rm --env-file .env -p 8000:8000 pdf-orchestrator
 ```
 
-**`docker-compose.yml`** levanta **solo el Orchestrator**, para desarrollo local y como smoke test de la imagen (`cp .env.example .env && docker compose up --build`). No incluye a Validator, Extractor ni Persistence: `POST /extraer` solo funciona si las `*_URL` de `.env` apuntan a servicios accesibles.
+**`docker-compose.yml`** levanta **solo el Orchestrator**, para desarrollo local y como smoke test de la imagen (`cp .env.example .env && docker compose up --build`). No incluye a Validator, Extractor ni Persistence: `POST /extraer` solo funciona si las `*_URL` de `.env` apuntan a servicios accesibles. El sistema completo se levanta con `docker-compose.integration.yml` (ver [Integración con Docker Compose](#integración-con-docker-compose)).
+
+## Integración con Docker Compose
+
+`docker-compose.integration.yml` levanta el sistema completo:
+
+```
+host :8080 → traefik → orchestrator → validator / extractor / persistence → mongo
+             └──── red edge ────┘└──────────── red backend (internal) ───────────┘
+```
+
+| Servicio | Origen | Red | Healthcheck |
+|----------|--------|-----|-------------|
+| `traefik` | `traefik:v3.6` | `edge` | — (lo verifica la prueba de humo con `GET /health`) |
+| `orchestrator` | este repositorio (`build: .`) | `edge` y `backend` | `GET /health` |
+| `validator` | `pdf-validator-service` @ `79e22ae3e734d05567c50805ac0eab33d3cbdc5b` | `backend` | `GET /health` |
+| `extractor` | `pdf-extract-service` @ `4166ba994cdebf6102f3608774b643bb751d2a4c` | `backend` | `GET /health` |
+| `persistence` | `pdf-persistence-service` @ `95acae239467d8de2b550d1944543536e5d29730` | `backend` | `GET /openapi.json`: **solo el proceso** (ver abajo) |
+| `mongo` | `mongo:8.0` | `backend` | `db.adminCommand('ping')` |
+
+- **Solo Traefik publica un puerto** (`PUBLIC_PORT`, por defecto `8080`). Traefik usa el provider Docker con `exposedbydefault=false` y enruta `PathPrefix(/)` únicamente al Orchestrator, que así responde también los 404 en RFC 9457. La red `backend` es `internal`: los servicios internos no son accesibles desde el host ni tienen salida a internet.
+- **URLs internas por nombre de servicio**, nunca `localhost`: `http://validator:8000`, `http://extractor:8000`, `http://persistence:8000` y `mongodb://mongo:27017/?serverSelectionTimeoutMS=5000`. El `serverSelectionTimeoutMS` hace que Persistence falle en 5 s, antes de escribir, si MongoDB no responde; sin él pymongo espera 30 s, más que el timeout del Orchestrator.
+- **Datos de integración aislados**: base `pdf_extractext_integracion` y volumen `pdf-integracion-mongo-data`.
+- **Una réplica por servicio**, con límites pensados para una máquina de 4 núcleos y ~4 GB para Docker (en total ~4 CPU y ~2.7 GB de techo). El Compose del Extractor, con 5 réplicas y su propio Traefik, no se usa.
+- `MAX_FILE_SIZE_MB=10` se declara en Validator y Extractor para que no se desalineen.
+
+### Versiones de los otros servicios
+
+Cada servicio se construye desde su repositorio fijado a un **SHA completo** de su `main`, que es inmutable: un clon local desactualizado no puede colarse. Esos SHA se verificaron contra lo que consume cada adapter (rutas, métodos, campo `file`, campos de entrada y salida, tipos y estados de error, `Retry-After`, variables y puerto). Para actualizar un servicio, se cambia su SHA en este archivo y se repite esa verificación.
+
+Cada contexto se puede reemplazar por una ruta local con `VALIDATOR_CONTEXT`, `EXTRACTOR_CONTEXT` y `PERSISTENCE_CONTEXT`. En ese caso, quien la use debe asegurarse de que el clon esté en el SHA indicado.
+
+### Disponibilidad de Persistence frente a conectividad con MongoDB
+
+Persistence **no tiene un endpoint `/health`**. Su healthcheck consulta `/openapi.json`, que FastAPI expone por defecto: **solo indica que el proceso responde, no que pueda leer o escribir en MongoDB**. La disponibilidad de MongoDB la comprueba su propio healthcheck (`ping`), y la conectividad real de Persistence con la base la comprueba la prueba de humo:
+
+- `GET /extractions/<id inexistente>` → `404`: Persistence consultó MongoDB, sin escribir.
+- `POST /extraer` → el documento existe en MongoDB y `GET /extractions/<id>` lo devuelve.
+
+Un `/health` de Persistence que haga ping a MongoDB es una mejora recomendada para su repositorio.
+
+### Requisitos
+
+Docker Desktop (backend WSL2 en Windows) con Docker Compose v2 y BuildKit. Para verificarlo:
+
+```powershell
+docker version            # debe mostrar Client y Server
+docker compose version    # v2.x
+docker info --format '{{.OSType}} CPUs={{.NCPU}} RAM={{.MemTotal}}'
+```
+
+Los contextos Git fijados a un SHA completo están documentados para BuildKit. Antes de levantar el stack, conviene confirmarlo con un solo servicio:
+
+```bash
+docker compose -f docker-compose.integration.yml config --quiet
+docker compose -f docker-compose.integration.yml build validator
+```
+
+### Levantar y probar
+
+```bash
+docker compose -f docker-compose.integration.yml up --build -d --wait
+E2E_BASE_URL=http://localhost:8080 \
+E2E_PDF=../pdf-extract-service/tests/stress/pdfs/2020-Scrum-Guide-Spanish-Latin-South-American.pdf \
+E2E_PAGINAS=16 \
+uv run pytest -m e2e -v
+```
+
+| Test | Qué comprueba | ¿Escribe en MongoDB? |
+|------|---------------|----------------------|
+| `test_health_a_traves_de_traefik` | `GET /health` a través de Traefik | No |
+| `test_solo_traefik_publica_puertos` | Ningún otro servicio publica puertos | No |
+| `test_cada_servicio_expone_la_ruta_post_que_consume_el_orchestrator` | `/openapi.json` de cada servicio incluye `POST /validate`, `POST /api/v1/extraer` y `POST /extractions` | No |
+| `test_persistence_consulta_mongodb_sin_escribir` | `GET /extractions/smoke-inexistente` → `404`, conteo sin cambios | No |
+| `test_flujo_completo_persiste_y_recupera` | Respuesta pública, documento en MongoDB (`file_name`, `page_count`, largo del texto) y `GET /extractions/<id>` | **Sí: 1 documento** |
+| `test_txt_rechazado_por_el_validator_sin_escribir` | `.txt` → `415` `/errors/unsupported-file-type`, conteo sin cambios | No |
+| `test_con_persistence_detenido_responde_503_sin_escribir` | `docker compose stop persistence` → `503`, conteo sin cambios; luego `start persistence` | No |
+| `test_con_validator_pausado_responde_504_al_vencer_el_timeout_sin_escribir` | `docker compose pause validator` → `504` entre 10 y 15 s (timeout real), conteo sin cambios; luego `unpause validator` | No |
+
+Cada corrida escribe **exactamente un documento**. Las consultas internas a Persistence se hacen desde el contenedor del Orchestrator con `docker compose exec`, sin publicar puertos.
+
+### Detener
+
+```bash
+docker compose -f docker-compose.integration.yml down       # conserva el volumen y los datos
+```
+
+`down -v` borra el volumen `pdf-integracion-mongo-data` con todas las extracciones de integración.
 
 ## Pendiente
 
-- **Compose de integración** con Validator (rama `feat/http-contract`), Extractor, Persistence y MongoDB en una red interna, con solo el Orchestrator publicado hacia el host. Su ubicación y forma de referenciar los otros repositorios están por decidir.
-- **Pruebas de punta a punta** con los servicios reales y PDFs reales, que confirmen también el timeout.
+- ~~**Ejecutar la integración en una máquina con Docker**~~ (completado): se levantó el entorno de `docker-compose.integration.yml` y las 10 pruebas E2E pasaron.
+- ~~**Confirmar el timeout** de 10 s con el sistema real~~ (completado): `test_con_validator_pausado_responde_504_al_vencer_el_timeout_sin_escribir` verificó contra el stack real que, con el Validator sin responder, el Orchestrator devuelve `504` entre 10 y 15 s sin escribir en MongoDB. No se midieron PDFs más pesados (ver [Timeout](#timeout)).
