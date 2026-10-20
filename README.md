@@ -199,9 +199,10 @@ Cualquier port puede además lanzar `ServicioNoDisponibleError` o `TiempoAgotado
 | Respuesta del Extractor | Resultado en el Orchestrator |
 |-------------------------|------------------------------|
 | `200` con `texto` (texto) y `metadatos.cantidad_paginas` (entero ≥ 0) | Sigue el flujo |
-| `413` / `422` `application/problem+json` con `title`/`detail` de texto | Se propaga al cliente con el mismo `status`, `title` y `detail`, y `type` `about:blank` |
+| `413` `application/problem+json` con `title`/`detail` de texto | Se propaga al cliente con el mismo `status`, `title` y `detail`, y `type` `about:blank` |
+| `422` `application/problem+json` con `title`/`detail` de texto | Se propaga con el mismo `status` y `title`, `type` `about:blank` y un `detail` fijo: el original puede incluir mensajes internos de la biblioteca de PDF |
 | `422` con la extensión `errors` | `502`: es la validación del request del Extractor, el Orchestrator lo armó mal |
-| `503` | `503` servicio no disponible; se propaga `Retry-After` si viene |
+| `503` | `503` servicio no disponible; se propaga `Retry-After` solo si es válido (segundos o IMF-fixdate) |
 | Timeout / fallo de conexión | `504` / `503` |
 | Cualquier otra respuesta, o `200` fuera de contrato | `502` `ExtraccionFallidaError` con mensaje fijo |
 

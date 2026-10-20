@@ -1,8 +1,10 @@
 """Infraestructura HTTP común a los adapters: clientes compartidos y errores de transporte."""
 
+import re
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -12,6 +14,14 @@ from app.exceptions import ArchivoRechazadoError, ServicioNoDisponibleError, Tie
 from app.problem_details import PROBLEM_JSON
 
 PDF_MIME_TYPE = "application/pdf"
+
+# Retry-After (RFC 9110 §10.2.3): delay-seconds o IMF-fixdate, el único formato de fecha
+# que un emisor debe generar (§5.6.7).
+DELAY_SECONDS = re.compile(r"[0-9]+")
+IMF_FIXDATE = re.compile(
+    r"(Mon|Tue|Wed|Thu|Fri|Sat|Sun), [0-9]{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT"
+)
 
 
 @dataclass(frozen=True)
@@ -49,16 +59,39 @@ def archivo_pdf(nombre_archivo: str, contenido: bytes) -> dict[str, tuple[str, b
     return {"file": (nombre_archivo, contenido, PDF_MIME_TYPE)}
 
 
-def rechazo_del_archivo(status_code: int, type_: str, problema: dict[str, Any]) -> ArchivoRechazadoError | None:
-    """Rechazo con el title y detail del problema, o None si alguno no es texto."""
+def rechazo_del_archivo(
+    status_code: int, type_: str, problema: dict[str, Any], detail_publico: str | None = None
+) -> ArchivoRechazadoError | None:
+    """Rechazo con el title y detail del problema, o None si alguno no es texto.
+
+    Con `detail_publico`, ese texto reemplaza al detail original en la respuesta al cliente.
+    """
     title, detail = problema.get("title"), problema.get("detail")
     if not (isinstance(title, str) and isinstance(detail, str)):
         return None
-    return ArchivoRechazadoError(status_code, type_, title, detail)
+    return ArchivoRechazadoError(status_code, type_, title, detail_publico or detail)
+
+
+def retry_after_valido(valor: str | None) -> str | None:
+    """Devuelve el valor si es un Retry-After válido; si no, None."""
+    if valor is None:
+        return None
+    if DELAY_SECONDS.fullmatch(valor):
+        return valor
+    if not IMF_FIXDATE.fullmatch(valor):
+        return None
+    try:
+        parsedate_to_datetime(valor)  # descarta fechas imposibles, como el día 32
+    except ValueError:
+        return None
+    return valor
 
 
 def no_disponible(servicio: str, retry_after: str | None = None) -> ServicioNoDisponibleError:
-    return ServicioNoDisponibleError(f"El servicio {servicio} no está disponible.", retry_after=retry_after)
+    """Servicio no disponible; el Retry-After solo se conserva si es válido."""
+    return ServicioNoDisponibleError(
+        f"El servicio {servicio} no está disponible.", retry_after=retry_after_valido(retry_after)
+    )
 
 
 @contextmanager
