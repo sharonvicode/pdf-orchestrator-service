@@ -1,13 +1,22 @@
 import pytest
 
 from app.adapters.fakes import FakeExtractor, FakePersistence, FakeValidator
-from app.exceptions import ExtraccionFallidaError, PdfInvalidoError, PersistenciaFallidaError
+from app.exceptions import (
+    ArchivoRechazadoError,
+    ExtraccionFallidaError,
+    PersistenciaFallidaError,
+    ServicioNoDisponibleError,
+    TiempoAgotadoError,
+)
 from app.services.orchestrator import OrchestratorService, ResultadoExtraccion
+from tests.stubs import ServicioQueFalla, ServicioQueRegistra
 
 pytestmark = pytest.mark.anyio
 
 NOMBRE = "documento.pdf"
 CONTENIDO = b"%PDF-1.7 contenido"
+ID = "6f1c2a9e-8f0e-4b8e-9a51-2b7c3d4e5f60"
+RECHAZO = ArchivoRechazadoError(415, "/errors/unsupported-file-type", "Tipo de archivo no soportado", "No es un PDF")
 
 
 def crear_servicio(validator=None, extractor=None, persistence=None):
@@ -26,17 +35,32 @@ async def test_llama_primero_al_validator_con_el_archivo():
     assert validator.llamadas == [(NOMBRE, CONTENIDO)]
 
 
-async def test_si_validator_rechaza_lanza_pdf_invalido_con_motivo():
-    servicio, *_ = crear_servicio(validator=FakeValidator(es_valido=False, motivo="No es un PDF"))
+async def test_llama_a_los_servicios_en_orden_validator_extractor_persistence():
+    registro: list[str] = []
+    servicio, *_ = crear_servicio(
+        validator=ServicioQueRegistra("validator", registro),
+        extractor=ServicioQueRegistra("extractor", registro),
+        persistence=ServicioQueRegistra("persistence", registro),
+    )
 
-    with pytest.raises(PdfInvalidoError, match="No es un PDF"):
+    await servicio.procesar(NOMBRE, CONTENIDO)
+
+    assert registro == ["validator", "extractor", "persistence"]
+
+
+async def test_si_validator_rechaza_propaga_el_rechazo():
+    servicio, *_ = crear_servicio(validator=FakeValidator(rechazo=RECHAZO))
+
+    with pytest.raises(ArchivoRechazadoError) as error:
         await servicio.procesar(NOMBRE, CONTENIDO)
+
+    assert error.value is RECHAZO
 
 
 async def test_si_validator_rechaza_no_llama_extractor_ni_persistence():
-    servicio, _, extractor, persistence = crear_servicio(validator=FakeValidator(es_valido=False))
+    servicio, _, extractor, persistence = crear_servicio(validator=FakeValidator(rechazo=RECHAZO))
 
-    with pytest.raises(PdfInvalidoError):
+    with pytest.raises(ArchivoRechazadoError):
         await servicio.procesar(NOMBRE, CONTENIDO)
 
     assert extractor.llamadas == []
@@ -59,18 +83,42 @@ async def test_si_persistence_falla_propaga_el_error():
         await servicio.procesar(NOMBRE, CONTENIDO)
 
 
-async def test_flujo_exitoso_extrae_y_persiste_el_texto():
-    servicio, _, extractor, persistence = crear_servicio(extractor=FakeExtractor(texto="hola mundo"))
+@pytest.mark.parametrize("error", [ServicioNoDisponibleError, TiempoAgotadoError])
+@pytest.mark.parametrize("paso", ["validator", "extractor", "persistence"])
+async def test_error_de_comunicacion_en_cualquier_paso_se_propaga(paso, error):
+    servicio, *_ = crear_servicio(**{paso: ServicioQueFalla(error("El servicio no respondió."))})
+
+    with pytest.raises(error):
+        await servicio.procesar(NOMBRE, CONTENIDO)
+
+
+async def test_si_validator_no_disponible_no_llama_extractor_ni_persistence():
+    fallido = ServicioQueFalla(ServicioNoDisponibleError("El Validator no está disponible."))
+    servicio, _, extractor, persistence = crear_servicio(validator=fallido)
+
+    with pytest.raises(ServicioNoDisponibleError):
+        await servicio.procesar(NOMBRE, CONTENIDO)
+
+    assert extractor.llamadas == []
+    assert persistence.llamadas == []
+
+
+async def test_flujo_exitoso_persiste_texto_y_cantidad_de_paginas_del_extractor():
+    servicio, _, extractor, persistence = crear_servicio(
+        extractor=FakeExtractor(texto="hola mundo", cantidad_paginas=3)
+    )
 
     await servicio.procesar(NOMBRE, CONTENIDO)
 
     assert extractor.llamadas == [(NOMBRE, CONTENIDO)]
-    assert persistence.llamadas == [(NOMBRE, "hola mundo")]
+    assert persistence.llamadas == [(NOMBRE, "hola mundo", 3)]
 
 
-async def test_flujo_exitoso_devuelve_texto_y_nombre_archivo():
-    servicio, *_ = crear_servicio(extractor=FakeExtractor(texto="hola mundo"))
+async def test_flujo_exitoso_devuelve_id_de_persistence_texto_y_nombre_archivo():
+    servicio, *_ = crear_servicio(
+        extractor=FakeExtractor(texto="hola mundo", cantidad_paginas=3), persistence=FakePersistence(id=ID)
+    )
 
     resultado = await servicio.procesar(NOMBRE, CONTENIDO)
 
-    assert resultado == ResultadoExtraccion(nombre_archivo=NOMBRE, texto="hola mundo")
+    assert resultado == ResultadoExtraccion(id=ID, nombre_archivo=NOMBRE, texto="hola mundo")

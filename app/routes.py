@@ -11,7 +11,7 @@ from app.services.orchestrator import OrchestratorService
 router = APIRouter()
 
 
-@router.get("/health/", response_model=HealthResponse)
+@router.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     """Indica que el Orchestrator está vivo. No consulta otros servicios."""
     return HealthResponse(status="ok")
@@ -25,4 +25,6 @@ async def extraer(
     """Recibe el archivo y delega todo el flujo en el OrchestratorService."""
     contenido = await file.read()
     resultado = await servicio.procesar(file.filename or "", contenido)
-    return ExtraccionResponse(exito=True, texto=resultado.texto, nombre_archivo=resultado.nombre_archivo)
+    return ExtraccionResponse(
+        exito=True, id=resultado.id, texto=resultado.texto, nombre_archivo=resultado.nombre_archivo
+    )
