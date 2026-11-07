@@ -9,8 +9,9 @@ ninguna llamada entre servicios. Se salta salvo que estén definidas:
 
 Escribe exactamente UN documento en pdf_extractext_integracion.extractions
 (test_flujo_completo_persiste_y_recupera). Detiene y vuelve a iniciar Persistence
-(test_con_persistence_detenido_responde_503_sin_escribir) y pausa y reanuda el Validator
-(test_con_validator_pausado_responde_504_al_vencer_el_timeout_sin_escribir). Pausa y reanuda, de a
+(test_con_persistence_detenido_traefik_responde_404_y_el_orchestrator_502_sin_escribir) y pausa y
+reanuda el Validator
+(test_con_validator_pausado_traefik_corta_a_los_8s_y_el_orchestrator_responde_502_sin_escribir). Pausa y reanuda, de a
 uno, Validator, Extractor y Persistence para abrir y recuperar su circuit breaker
 (test_circuit_breaker_se_abre_rechaza_sin_escribir_y_se_recupera). No borra datos ni volúmenes.
 
@@ -222,26 +223,34 @@ def test_txt_rechazado_por_el_validator_sin_escribir():
     assert contar_extracciones() == antes
 
 
-def test_con_persistence_detenido_responde_503_sin_escribir():
+def test_con_persistence_detenido_traefik_responde_404_y_el_orchestrator_502_sin_escribir():
+    # Con el contenedor detenido, Traefik deja de descubrirlo y borra su ruta: responde 404 sin pasar
+    # por el circuit breaker. El adapter de Persistence trata toda respuesta distinta de 201 como
+    # fuera de contrato (502). Antes de Traefik el Orchestrator fallaba al conectar y respondía 503.
     antes = contar_extracciones()
     compose("stop", "persistence")
     try:
+        status_traefik, _ = get_interno(f"{TRAEFIK_INTERNO}/persistence/openapi.json")
         response = subir(PDF.name, PDF.read_bytes(), "application/pdf")
     finally:
         compose("start", "persistence")
         esperar_healthy("persistence")
         esperar_alcanzable("persistence")
 
-    assert response.status_code == 503
+    assert status_traefik == 404
+    assert response.status_code == 502
     assert response.headers["content-type"].startswith(PROBLEM_JSON)
-    assert response.json()["title"] == "Servicio no disponible"
+    assert response.json()["title"] == "Falló la persistencia del texto"
+    assert response.json()["detail"] == "Persistence respondió fuera del contrato esperado."
     assert contar_extracciones() == antes
 
 
-def test_con_validator_pausado_responde_504_al_vencer_el_timeout_sin_escribir():
-    # `pause` congela el proceso pero el kernel sigue aceptando la conexión: el Orchestrator espera
-    # de verdad hasta que vence su timeout (a diferencia de `stop`, que falla al conectar). Se pausa
-    # el Validator, el primer paso, para que el flujo nunca llegue a Persistence.
+def test_con_validator_pausado_traefik_corta_a_los_8s_y_el_orchestrator_responde_502_sin_escribir():
+    # `pause` congela el proceso pero el kernel sigue aceptando la conexión: la llamada espera de verdad
+    # (a diferencia de `stop`). Traefik corta primero, al vencer su responseHeaderTimeout, con un 504
+    # que cuenta para el circuit breaker. El adapter del Validator no interpreta ese 504 como timeout:
+    # lo trata como respuesta fuera de contrato (502). La duración prueba que cortó Traefik y no el
+    # Orchestrator. Se pausa el Validator, el primer paso, para que el flujo nunca llegue a Persistence.
     antes = contar_extracciones()
     try:
         # Dentro del try: si `pause` falla después de congelar el contenedor, igual se reanuda.
@@ -252,15 +261,15 @@ def test_con_validator_pausado_responde_504_al_vencer_el_timeout_sin_escribir():
     finally:
         compose("unpause", "validator")
         esperar_healthy("validator")
-        # Con el Validator detrás de Traefik, este fallo abre su circuito: se espera a que se cierre
-        # para no contaminar las pruebas siguientes.
+        # Este fallo abre el circuito del Validator: se espera a que se cierre para no contaminar
+        # las pruebas siguientes.
         esperar_alcanzable("validator")
 
-    assert response.status_code == 504
+    assert response.status_code == 502
     assert response.headers["content-type"].startswith(PROBLEM_JSON)
-    assert response.json()["title"] == "Tiempo de espera agotado"
-    assert response.json()["detail"] == "El servicio Validator no respondió a tiempo."
-    assert TIMEOUT_DEL_ORCHESTRATOR <= duracion < TIMEOUT_DEL_ORCHESTRATOR + 5
+    assert response.json()["title"] == "Falló la validación del archivo"
+    assert response.json()["detail"] == "El Validator respondió fuera del contrato esperado."
+    assert TIMEOUT_DE_TRAEFIK <= duracion < TIMEOUT_DEL_ORCHESTRATOR
     assert contar_extracciones() == antes
 
 
