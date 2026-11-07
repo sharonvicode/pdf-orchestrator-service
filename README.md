@@ -18,6 +18,8 @@ Persistence    POST /extractions
 MongoDB (solo accesible por Persistence)
 ```
 
+En la integración con Docker Compose, cada llamada del Orchestrator a Validator, Extractor y Persistence pasa por **Traefik**, que aplica un circuit breaker independiente por servicio (ver [Circuit breaker](#circuit-breaker)). El código del Orchestrator no lo sabe: solo cambian sus URLs.
+
 ## Responsabilidad
 
 El Orchestrator **solo coordina**:
@@ -67,7 +69,7 @@ Registro de la revisión del diseño actual: qué se comprobó y qué límites s
 | **LSP** | Los adapters HTTP, los fakes y los dobles de `tests/stubs.py` cumplen los mismos ports, y el caso de uso se prueba igual con cualquiera de ellos. | Los `Protocol` no se comprueban en ejecución; lo sostienen los tipos y los tests. |
 | **ISP** | Un port por servicio, con un único método cada uno (`validar`, `extraer`, `guardar`). | — |
 | **DRY** | `app/adapters/http.py` reúne lo común a los adapters: `errores_de_transporte`, `leer_problema`, `archivo_pdf`, `rechazo_del_archivo` y `no_disponible`. | `_rechazo` del Validator y del Extractor se parecen, pero no se unifican: cada uno aplica reglas distintas de su contrato. Los healthchecks de `docker-compose.integration.yml` repiten la misma línea. |
-| **KISS** | Un `httpx.AsyncClient` por servicio, abierto en el `lifespan`; sin reintentos, colas ni circuit breaker; los fallos se reducen a `502`, `503`, `504` y los rechazos propagados. | Un único `HTTP_TIMEOUT_SECONDS` para los tres servicios, aplicado por fase y no como límite total. |
+| **KISS** | Un `httpx.AsyncClient` por servicio, abierto en el `lifespan`; sin reintentos ni colas; el circuit breaker es de Traefik, no del código Python; los fallos se reducen a `502`, `503`, `504` y los rechazos propagados. | Un único `HTTP_TIMEOUT_SECONDS` para los tres servicios, aplicado por fase y no como límite total. |
 | **YAGNI** | Sin caché ni reintentos; `/health` no consulta otros servicios; no hay variables de configuración sin uso. | `app/adapters/fakes.py` solo lo usan los tests, pero vive en el paquete `app` (ver abajo). |
 
 **`app/adapters/fakes.py`.** Solo lo importan `tests/api/test_extraer.py` y `tests/unit/test_orchestrator_service.py`; ni `main.py` ni otro módulo de `app/` lo importa, así que no participa de la ejecución. Se incluye en la imagen porque el `Dockerfile` copia `app/` completo; es un archivo chico y sin dependencias propias. Moverlo a `tests/` sería más prolijo, pero obligaría a cambiar los imports de esas pruebas sin corregir ningún defecto, así que se deja donde está.
@@ -95,7 +97,7 @@ Registro de la revisión del diseño actual: qué se comprobó y qué límites s
 │       └── orchestrator.py     # Caso de uso OrchestratorService
 ├── tests/
 │   ├── api/                    # Endpoints, RFC 9457 y flujo HTTP completo (TestClient)
-│   ├── unit/                   # Caso de uso, adapters, configuración y entrypoint
+│   ├── unit/                   # Caso de uso, adapters, configuración, entrypoint y contrato del Compose de integración
 │   ├── e2e/                    # Prueba de humo contra el stack de integración (Docker)
 │   └── stubs.py                # Dobles de prueba auxiliares
 ├── Dockerfile
@@ -166,6 +168,7 @@ Los errores de validación del request incluyen además una lista `errors` con `
 
 - `errores_de_transporte()` (`app/adapters/http.py`) traduce los timeouts de httpx a 504 y los fallos de conexión a 503, con mensajes fijos. Como `httpx.TimeoutException` es subclase de `httpx.TransportError`, captura primero el timeout.
 - Nunca se exponen al cliente detalles internos (causas, trazas, hosts, mensajes de bibliotecas). Los 500 se registran en el log; los 502 usan mensajes fijos.
+- Con Traefik entre el Orchestrator y los servicios, varios fallos llegan como **respuestas** de Traefik y no como errores de transporte: su traducción está en [Respuestas de Traefik](#respuestas-de-traefik-y-su-traducción).
 
 ## Contratos con los servicios
 
@@ -210,7 +213,22 @@ Persistence no garantiza RFC 9457: sus errores pueden ser JSON de FastAPI o text
 | Timeout / fallo de conexión | `504` / `503` |
 | Cualquier otro status (incluidos otros 2xx y `503`, que no están en su contrato), cuerpo ilegible, `id` ausente, vacío, en blanco o que no sea string | `502` `PersistenciaFallidaError` con mensaje fijo |
 
-**Sin reintentos.** El alta no es idempotente: un segundo `POST` crearía otra extracción. Si el timeout vence después de que Persistence guardó, el cliente recibe `504` aunque la extracción exista; **si el cliente reintenta, se crea un duplicado**. Un cliente que reintente tras un `504` debe asumir ese riesgo.
+**Sin reintentos.** El alta no es idempotente: un segundo `POST` crearía otra extracción. Si el timeout vence después de que Persistence guardó, el cliente recibe un error aunque la extracción exista (`502` si cortó Traefik, `504` si cortó el Orchestrator); **si el cliente reintenta, se crea un duplicado**. Un cliente que reintente tras ese error debe asumir ese riesgo.
+
+### Respuestas de Traefik y su traducción
+
+En la integración, el Orchestrator habla con Traefik y Traefik con cada servicio. Algunos fallos de un servicio llegan entonces como una respuesta HTTP **generada por Traefik**, en texto plano, que los adapters interpretan con las mismas reglas de las tablas anteriores. Los adapters no se modificaron para distinguirlas:
+
+| Situación del servicio | Responde Traefik | Validator | Extractor | Persistence |
+|------------------------|------------------|-----------|-----------|-------------|
+| No responde a tiempo (por ejemplo, pausado) | `504` a los 8 s (`responseHeaderTimeout`) | `502` | `502` | `502` |
+| Circuito abierto | `503` inmediato, sin `Retry-After` | `503` | `503` | `502` |
+| Contenedor detenido (Traefik borra su ruta) | `404` | `502` | `502` | `502` |
+| Inalcanzable con la ruta todavía registrada | `502` | `502` | `502` | `502` |
+
+- El `504` de Traefik **no** se traduce a `504` `TiempoAgotadoError`: para los adapters es una respuesta fuera de contrato, así que el cliente recibe `502` con el mensaje fijo del servicio (por ejemplo, *"El Validator respondió fuera del contrato esperado."*). El `504` propio del Orchestrator (`HTTP_TIMEOUT_SECONDS`) queda como red de seguridad y en la práctica no se alcanza, porque Traefik corta antes.
+- El `503` del circuito abierto llega como `503` *"Servicio no disponible"* desde Validator y Extractor, que ya traducían su `503`. Persistence no tiene `503` en su contrato y lo traduce a `502`.
+- Distinguir estas respuestas (por ejemplo, `504` de Traefik → `504`) requeriría modificar los adapters; queda fuera del alcance (ver [Pendiente](#pendiente)).
 
 ## Configuración
 
@@ -226,6 +244,7 @@ Se centraliza en `app/config.py` (`Settings`, basada en `pydantic-settings`). Se
 | `PORT` | No | `8000` | Puerto del Orchestrator |
 
 - Las URLs aceptan hostnames de Docker (por ejemplo `http://validator:8000`) y no tienen valor por defecto. `HttpUrl` normaliza agregando `/` final; los adapters usan `httpx.AsyncClient(base_url=...)`.
+- Una URL puede incluir un prefijo de ruta: httpx lo conserva y le agrega la ruta del contrato. En la integración se usan `http://traefik:8081/validator`, `http://traefik:8081/extractor` y `http://traefik:8081/persistence`, y el Orchestrator llama, por ejemplo, a `http://traefik:8081/validator/validate`.
 - `main.run()` construye `Settings` al arrancar el servidor: si falta una variable obligatoria o hay un valor inválido, el proceso falla **antes** de levantar. Usa `PORT` y `LOG_LEVEL`.
 - El `lifespan` de FastAPI vuelve a leer `Settings` y abre un `httpx.AsyncClient` compartido por servicio, con su URL como `base_url` y `HTTP_TIMEOUT_SECONDS` como timeout. Los cierra al apagar. Si la configuración es inválida, la app no arranca.
 - Importar la app (`main:app`) no lee la configuración: los tests que no ejecutan el lifespan no necesitan `.env`.
@@ -240,7 +259,16 @@ Se mantiene en **10 s**, según lo medido en el Extractor (README y `TASK/tp-tes
 - Cada proceso del Extractor extrae de a uno y encola hasta 20 pedidos; con la cola llena responde `503` al instante. Una cola llena de PDFs como esos se vacía en ~3 s, dentro del timeout.
 - Bajo sobrecarga sostenida (50 req/s) la mediana llegó a ~14.7 s. Ahí subir el timeout no ayuda: el pedido sigue esperando en una cola saturada, y el `504` libera antes al cliente.
 
-Revisar el valor con las pruebas de punta a punta (PDFs más pesados por CPU, como uno de 300 páginas, no tienen medición individual). Un servicio puede terminar su trabajo aunque el Orchestrator ya haya respondido `504`; para Persistence eso implica el riesgo de duplicados descrito en su contrato.
+Revisar el valor con las pruebas de punta a punta (PDFs más pesados por CPU, como uno de 300 páginas, no tienen medición individual). Un servicio puede terminar su trabajo aunque el Orchestrator ya haya respondido; para Persistence eso implica el riesgo de duplicados descrito en su contrato.
+
+**Con Traefik en el medio** hay dos timeouts, y el de Traefik es menor a propósito:
+
+| Timeout | Valor | Dónde | Efecto |
+|---------|-------|-------|--------|
+| `responseHeaderTimeout` | `8s` | `serversTransport` `interno` de Traefik | Corta la espera de los headers del servicio y responde `504`, que **cuenta para el circuit breaker**. |
+| `HTTP_TIMEOUT_SECONDS` | `10` | Orchestrator (httpx, por fase) | Red de seguridad. Si cortara primero, Traefik nunca registraría el fallo y el circuito no se abriría. |
+
+Un pedido encolado por el backpressure del Extractor que espere más de 8 s también recibe ese `504` y cuenta como error de red (ver [Circuit breaker](#circuit-breaker)).
 
 ## Desarrollo
 
@@ -268,6 +296,8 @@ Los tests de `tests/unit` y `tests/api` no levantan otros servicios:
 - el caso de uso y los endpoints se prueban con los fakes de `app/adapters/fakes.py` y los dobles de `tests/stubs.py`;
 - los adapters y el flujo completo (`tests/api/test_flujo_http.py`) usan `httpx.MockTransport`, incluido en httpx, para simular las respuestas de cada servicio y verificar los requests, el orden de las llamadas y la ausencia de reintentos.
 
+`tests/unit/test_compose_integracion.py` lee `docker-compose.integration.yml` con PyYAML (dependencia de desarrollo), igual que Traefik lee las labels, y fija la configuración del circuit breaker sin levantar contenedores (ver [Circuit breaker](#circuit-breaker)).
+
 `tests/e2e` es la prueba de humo contra el sistema real (ver [Integración con Docker Compose](#integración-con-docker-compose)); sin sus variables de entorno se salta.
 
 ## Docker
@@ -291,21 +321,22 @@ docker run --rm --env-file .env -p 8000:8000 pdf-orchestrator
 `docker-compose.integration.yml` levanta el sistema completo:
 
 ```
-host :8080 → traefik → orchestrator → validator / extractor / persistence → mongo
-             └──── red edge ────┘└──────────── red backend (internal) ───────────┘
+host :8080 → traefik (web :80) → orchestrator → traefik (interno :8081) → validator / extractor / persistence → mongo
+             └────────── red edge ──────────┘└───────────────────── red backend (internal) ─────────────────────┘
 ```
 
 | Servicio | Origen | Red | Healthcheck |
 |----------|--------|-----|-------------|
-| `traefik` | `traefik:v3.6` | `edge` | — (lo verifica la prueba de humo con `GET /health`) |
+| `traefik` | `traefik:v3.6` | `edge` y `backend` | — (lo verifica la prueba de humo con `GET /health`) |
 | `orchestrator` | este repositorio (`build: .`) | `edge` y `backend` | `GET /health` |
 | `validator` | `pdf-validator-service` @ `79e22ae3e734d05567c50805ac0eab33d3cbdc5b` | `backend` | `GET /health` |
 | `extractor` | `pdf-extract-service` @ `4166ba994cdebf6102f3608774b643bb751d2a4c` | `backend` | `GET /health` |
-| `persistence` | `pdf-persistence-service` @ `95acae239467d8de2b550d1944543536e5d29730` | `backend` | `GET /openapi.json`: **solo el proceso** (ver abajo) |
+| `persistence` | `pdf-persistence-service` @ `3d70c07fc2ad0cede5b9e56e4f1ae438f0168cb7` | `backend` | `GET /openapi.json`: **solo el proceso** (ver abajo) |
 | `mongo` | `mongo:8.0` | `backend` | `db.adminCommand('ping')` |
 
-- **Solo Traefik publica un puerto** (`PUBLIC_PORT`, por defecto `8080`). Traefik usa el provider Docker con `exposedbydefault=false` y enruta `PathPrefix(/)` únicamente al Orchestrator, que así responde también los 404 en RFC 9457. La red `backend` es `internal`: los servicios internos no son accesibles desde el host ni tienen salida a internet.
-- **URLs internas por nombre de servicio**, nunca `localhost`: `http://validator:8000`, `http://extractor:8000`, `http://persistence:8000` y `mongodb://mongo:27017/?serverSelectionTimeoutMS=5000`. El `serverSelectionTimeoutMS` hace que Persistence falle en 5 s, antes de escribir, si MongoDB no responde; sin él pymongo espera 30 s, más que el timeout del Orchestrator.
+- **Solo Traefik publica un puerto** (`PUBLIC_PORT`, por defecto `8080`, hacia su entrypoint `web`). Traefik usa el provider Docker con `exposedbydefault=false` y en `web` enruta `PathPrefix(/)` únicamente al Orchestrator, que así responde también los 404 en RFC 9457. La red `backend` es `internal`: los servicios internos no son accesibles desde el host ni tienen salida a internet.
+- **Entrypoint interno de Traefik** (`interno`, puerto `8081`, sin publicar): por ahí el Orchestrator llama a los tres servicios. Solo es alcanzable desde la red de Docker.
+- **URLs internas por nombre de servicio**, nunca `localhost`: `http://traefik:8081/validator`, `http://traefik:8081/extractor`, `http://traefik:8081/persistence` y `mongodb://mongo:27017/?serverSelectionTimeoutMS=5000`. El `serverSelectionTimeoutMS` hace que Persistence falle en 5 s, antes de escribir, si MongoDB no responde; sin él pymongo espera 30 s, más que el timeout del Orchestrator.
 - **Datos de integración aislados**: base `pdf_extractext_integracion` y volumen `pdf-integracion-mongo-data`.
 - **Una réplica por servicio**, con límites pensados para una máquina de 4 núcleos y ~4 GB para Docker (en total ~4 CPU y ~2.7 GB de techo). El Compose del Extractor, con 5 réplicas y su propio Traefik, no se usa.
 - `MAX_FILE_SIZE_MB=10` se declara en Validator y Extractor para que no se desalineen.
@@ -315,6 +346,61 @@ host :8080 → traefik → orchestrator → validator / extractor / persistence 
 Cada servicio se construye desde su repositorio fijado a un **SHA completo** de su `main`, que es inmutable: un clon local desactualizado no puede colarse. Esos SHA se verificaron contra lo que consume cada adapter (rutas, métodos, campo `file`, campos de entrada y salida, tipos y estados de error, `Retry-After`, variables y puerto). Para actualizar un servicio, se cambia su SHA en este archivo y se repite esa verificación.
 
 Cada contexto se puede reemplazar por una ruta local con `VALIDATOR_CONTEXT`, `EXTRACTOR_CONTEXT` y `PERSISTENCE_CONTEXT`. En ese caso, quien la use debe asegurarse de que el clon esté en el SHA indicado.
+
+- **Persistence** pasó de `95acae2` a `3d70c07` (su `main`). El contrato que consume el adapter no cambió (`POST /extractions` → `201 {"id"}`, `GET /extractions/{id}`), ni el `Dockerfile` ni sus dependencias. Lo nuevo es un `413` cuando el texto supera el límite de documento de MongoDB, que el adapter ya traduce a `502` como cualquier otro status.
+- **Extractor** sigue en `4166ba9`: su `main` actual solo agrega el circuit breaker a **su propio** Compose, que esta integración no usa; el código del servicio no cambió.
+
+### Circuit breaker
+
+Si un servicio deja de responder, Traefik **deja de mandarle pedidos por un tiempo** y responde `503` al instante, en lugar de dejar cada pedido esperando el timeout. Así la falla de un servicio no se propaga al Orchestrator (fallo en cascada) y el servicio se recupera sin recibir más carga.
+
+Lo maneja **Traefik**, no el código Python, igual que en el Compose del Extractor. Se configura en `docker-compose.integration.yml`:
+
+- **Entrypoint interno** `interno` (`--entrypoints.interno.address=:8081`), sin publicar en el host.
+- **Por servicio**, con labels en Validator, Extractor y Persistence: un router `PathPrefix(/<servicio>)` solo en `interno`, un middleware `<servicio>-circuit-breaker`, un middleware `<servicio>-sin-prefijo` que quita el prefijo (el servicio recibe sus rutas originales) y el `serversTransport` `interno@file`.
+- **Timeout**: el `serversTransport` `interno` se define con un file provider cuyo contenido está inline en `configs` del mismo Compose, porque las labels de Docker pueden referenciar un `serversTransport` pero no definirlo. No se usa `--serversTransport.forwardingTimeouts.responseHeaderTimeout` global, como en el Compose del Extractor, porque también cortaría el salto público Cliente → Traefik → Orchestrator antes de que el Orchestrator responda su Problem Details.
+
+```
+CERRADO ──más del 50% de errores de red──► ABIERTO ──10 s──► SEMIABIERTO ──10 s sin fallar──► CERRADO
+         (502/504 en la ventana de 10 s)    (503 inmediato)   (deja pasar tráfico de a poco;
+                                                               si falla, vuelve a ABIERTO)
+```
+
+| Parámetro | Valor | Opción de Traefik | Significado (Traefik v3.6) |
+|-----------|-------|-------------------|----------------------------|
+| Umbral | `NetworkErrorRatio() > 0.50` | `circuitbreaker.expression` | Proporción de respuestas `502` o `504` sobre el total, en una ventana móvil de 10 s (buckets de 1 s) fija en Traefik y sin mínimo de pedidos: un solo `504` en la ventana da 1.0 y abre el circuito. Se evalúa cada 100 ms (`checkPeriod` por defecto). |
+| Abierto | `10s` | `circuitbreaker.fallbackDuration` | Tiempo en que responde `503` (texto plano, sin `Retry-After`) sin llamar al servicio. |
+| Semiabierto | `10s` | `circuitbreaker.recoveryDuration` | Tiempo en que deja pasar una proporción creciente del tráfico antes de cerrarse. |
+| Timeout | `8s` | `serversTransports.interno.forwardingTimeouts.responseHeaderTimeout` | Espera de los headers después de enviar el pedido completo; al vencer, `504`. |
+
+- **Independientes**: cada servicio tiene su propio middleware y su propio router. Con el circuito del Validator abierto, Extractor y Persistence siguen respondiendo `200` (verificado en la prueba de humo).
+- **Backpressure del Extractor**: su `503` intencional (cola llena, `application/problem+json` con `Retry-After`) no es un error de red y **no abre el circuito**. Se verificó con una ráfaga de 150 pedidos concurrentes a `traefik:8081/extractor/api/v1/extraer`: 105 respondieron `503` del Extractor (70 %, más que el umbral) y 45 `200`, sin ningún `504`. Inmediatamente después, `GET /extractor/health` respondió `200` en ~12 ms y Traefik no registró ningún cambio de estado del circuito.
+- **Límite conocido**: un pedido que espere en la cola del Extractor más de 8 s recibe el `504` de Traefik, y ese sí cuenta. En la ráfaga anterior ningún pedido llegó a 8 s (el más lento tardó ~5 s); con PDFs más pesados podría pasar.
+- **`stop` y `pause` no son lo mismo.** Con `docker compose stop`, Traefik deja de descubrir el contenedor, borra su ruta y responde `404` sin pasar por el circuit breaker. Con `docker compose pause`, el kernel sigue aceptando la conexión, Traefik corta con `504` a los 8 s y el circuito se abre. La label `traefik.docker.allownonrunning=true`, que según la documentación respondería `503` con el contenedor detenido, **se descartó**: en Traefik v3.6.25 respondió `500` (`unsupported protocol scheme ""`), que tampoco cuenta para el circuito.
+- La traducción al cliente de estas respuestas está en [Respuestas de Traefik](#respuestas-de-traefik-y-su-traducción).
+
+**Cómo comprobarlo** con el stack levantado (ejemplo con el Validator; vale igual para `extractor` y `persistence`). La sonda hace un `GET` desde el contenedor del Orchestrator, porque el entrypoint interno no está publicado:
+
+```bash
+C="docker compose -f docker-compose.integration.yml"
+sonda() { $C exec -T orchestrator python -c "import sys,time,urllib.request as u,urllib.error as e
+t=time.monotonic()
+try: s=u.urlopen(sys.argv[1],timeout=15).status
+except e.HTTPError as x: s=x.code
+print(s, round(time.monotonic()-t,3))" "http://traefik:8081/$1/openapi.json"; }
+
+$C pause validator
+sonda validator     # 504 en ~8 s: abre el circuito
+sonda validator     # 503 en milisegundos: circuito abierto
+sonda extractor     # 200: los otros circuitos siguen cerrados
+$C unpause validator
+sonda validator     # repetir cada segundo: 503 durante la ventana de 10 s, luego 200
+$C logs traefik | grep validator-circuit-breaker   # estados tripped y recovering
+```
+
+En Git Bash sobre Windows, anteponer `MSYS_NO_PATHCONV=1` si alguna ruta se convierte. Medición real (prueba de humo): `504` en 8 s, `503` en menos de 1 s y `200` entre 9 y 35 s después de abrirse el circuito.
+
+`tests/unit/test_compose_integracion.py` fija esta configuración y `test_circuit_breaker_se_abre_rechaza_sin_escribir_y_se_recupera` la comprueba contra el stack real.
 
 ### Disponibilidad de Persistence frente a conectividad con MongoDB
 
@@ -360,10 +446,13 @@ uv run pytest -m e2e -v
 | `test_persistence_consulta_mongodb_sin_escribir` | `GET /extractions/smoke-inexistente` → `404`, conteo sin cambios | No |
 | `test_flujo_completo_persiste_y_recupera` | Respuesta pública, documento en MongoDB (`file_name`, `page_count`, largo del texto) y `GET /extractions/<id>` | **Sí: 1 documento** |
 | `test_txt_rechazado_por_el_validator_sin_escribir` | `.txt` → `415` `/errors/unsupported-file-type`, conteo sin cambios | No |
-| `test_con_persistence_detenido_responde_503_sin_escribir` | `docker compose stop persistence` → `503`, conteo sin cambios; luego `start persistence` | No |
-| `test_con_validator_pausado_responde_504_al_vencer_el_timeout_sin_escribir` | `docker compose pause validator` → `504` entre 10 y 15 s (timeout real), conteo sin cambios; luego `unpause validator` | No |
+| `test_con_persistence_detenido_traefik_responde_404_y_el_orchestrator_502_sin_escribir` | `docker compose stop persistence` → Traefik `404` en la ruta interna y `502` al cliente, conteo sin cambios; luego `start persistence` | No |
+| `test_con_validator_pausado_traefik_corta_a_los_8s_y_el_orchestrator_responde_502_sin_escribir` | `docker compose pause validator` → `502` entre 8 y 10 s (cortó Traefik, no el Orchestrator), conteo sin cambios; luego `unpause validator` y espera a que su circuito se cierre | No |
+| `test_traefik_publica_solo_el_entrypoint_web` | Traefik publica solo el puerto `80`; el entrypoint interno no | No |
+| `test_cada_servicio_responde_a_traves_del_entrypoint_interno` | `traefik:8081/<servicio>/openapi.json` llega a cada servicio, sin el prefijo | No |
+| `test_circuit_breaker_se_abre_rechaza_sin_escribir_y_se_recupera` | Por servicio, con `pause`: `504` de Traefik entre 8 y 10 s, luego `503` en menos de 1 s, los otros dos circuitos en `200`, el cliente rechazado sin esperar un timeout (`503` Validator/Extractor, `502` Persistence), conteo sin cambios y `200` de nuevo entre 9 y 35 s | No |
 
-Cada corrida escribe **exactamente un documento**. Las consultas internas a Persistence se hacen desde el contenedor del Orchestrator con `docker compose exec`, sin publicar puertos.
+Cada corrida escribe **exactamente un documento** y tarda ~4.5 min, casi todo esperando que los circuitos se recuperen. Las consultas internas se hacen desde el contenedor del Orchestrator con `docker compose exec`, sin publicar puertos. El circuito de Persistence se abre con un `GET` de solo lectura: un `POST` quedaría encolado en el contenedor pausado y podría escribir al reanudarlo.
 
 ### Detener
 
@@ -376,4 +465,7 @@ docker compose -f docker-compose.integration.yml down       # conserva el volume
 ## Pendiente
 
 - ~~**Ejecutar la integración en una máquina con Docker**~~ (completado): se levantó el entorno de `docker-compose.integration.yml` y las 10 pruebas E2E pasaron.
-- ~~**Confirmar el timeout** de 10 s con el sistema real~~ (completado): `test_con_validator_pausado_responde_504_al_vencer_el_timeout_sin_escribir` verificó contra el stack real que, con el Validator sin responder, el Orchestrator devuelve `504` entre 10 y 15 s sin escribir en MongoDB. No se midieron PDFs más pesados (ver [Timeout](#timeout)).
+- ~~**Confirmar el timeout** de 10 s con el sistema real~~ (completado): se verificó contra el stack real que, con el Validator sin responder, el Orchestrator devolvía `504` entre 10 y 15 s sin escribir en MongoDB. Con el circuit breaker, Traefik corta antes, a los 8 s (ver [Timeout](#timeout)). No se midieron PDFs más pesados.
+- ~~**Circuit breaker**~~ (completado): tres circuit breakers independientes en Traefik, verificados contra el stack real (ver [Circuit breaker](#circuit-breaker)).
+- **Traducir las respuestas de Traefik en los adapters** (requiere cambiar código Python; no se hizo para mantener el circuit breaker solo en infraestructura): hoy el `504` de Traefik llega al cliente como `502` en lugar de `504`, el `503` del circuito de Persistence como `502` en lugar de `503`, y Persistence detenido como `502` en lugar del `503` que daba antes de Traefik (ver [Respuestas de Traefik](#respuestas-de-traefik-y-su-traducción)).
+- **Medir la cola del Extractor con PDFs pesados**: un pedido encolado más de 8 s recibe `504` de Traefik y cuenta para el circuit breaker.

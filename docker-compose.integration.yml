@@ -1,7 +1,9 @@
 # Compose de INTEGRACIÓN del sistema PDF ExtractText:
-#   Cliente → Traefik → Orchestrator → Validator → Extractor → Persistence → MongoDB
+#   Cliente → Traefik (web) → Orchestrator → Traefik (interno) → Validator / Extractor / Persistence → MongoDB
 #
-# - Solo Traefik publica un puerto hacia el host; el resto queda en redes internas.
+# - Solo Traefik publica un puerto hacia el host (entrypoint web); el resto queda en redes internas.
+# - El Orchestrator llama a los tres servicios a través del entrypoint interno de Traefik
+#   (traefik:8081/<servicio>, no publicado). Cada servicio tiene su propio circuit breaker.
 # - Validator, Extractor y Persistence se construyen desde su repositorio fijado a un SHA
 #   completo (inmutable). Cada contexto se puede reemplazar por una ruta local con
 #   VALIDATOR_CONTEXT, EXTRACTOR_CONTEXT y PERSISTENCE_CONTEXT.
@@ -93,6 +95,13 @@ services:
       context: "${VALIDATOR_CONTEXT:-https://github.com/sharonvicode/pdf-validator-service.git#79e22ae3e734d05567c50805ac0eab33d3cbdc5b}"
     environment:
       MAX_FILE_SIZE_MB: "10"
+    # Mismo esquema en Validator, Extractor y Persistence (cambia solo el nombre del servicio):
+    # - router solo en el entrypoint interno, para las URLs del Orchestrator traefik:8081/<servicio>;
+    # - circuit breaker propio: se abre si más de la mitad de las respuestas son errores de red
+    #   (502/504: servicio inalcanzable o timeout de 8 s); el 503 del backpressure del Extractor no
+    #   cuenta. Abierto, responde 503 al instante durante 10 s y luego se recupera de a poco en 10 s;
+    # - sin-prefijo: el servicio recibe sus rutas originales (/validate, /api/v1/extraer, /extractions);
+    # - serversTransport interno@file: el timeout de 8 s definido en configs.
     labels:
       - traefik.enable=true
       - traefik.docker.network=pdf-integracion-backend
@@ -215,7 +224,7 @@ networks:
   # Traefik y Orchestrator: la única red con un puerto publicado.
   edge:
     name: pdf-integracion-edge
-  # Servicios internos y MongoDB, sin salida a internet.
+  # Traefik (entrypoint interno), Orchestrator, servicios internos y MongoDB, sin salida a internet.
   backend:
     name: pdf-integracion-backend
     internal: true
