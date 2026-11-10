@@ -1,7 +1,10 @@
 # Compose de INTEGRACIÓN del sistema PDF ExtractText:
-#   Cliente → Traefik → Orchestrator → Validator → Extractor → Persistence → MongoDB
+#   Cliente → Traefik (web) → Orchestrator → Traefik (interno) → Validator / Extractor / Persistence → MongoDB
 #
-# - Solo Traefik publica un puerto hacia el host; el resto queda en redes internas.
+# - Solo Traefik publica un puerto hacia el host (entrypoint web); el resto queda en redes internas.
+# - El Orchestrator llama a los tres servicios a través del entrypoint interno de Traefik
+#   (traefik:8081/<servicio>, no publicado). Cada servicio se registra en Consul y Traefik lo descubre
+#   mediante su provider consulCatalog, con su propio circuit breaker.
 # - Validator, Extractor y Persistence se construyen desde su repositorio fijado a un SHA
 #   completo (inmutable). Cada contexto se puede reemplazar por una ruta local con
 #   VALIDATOR_CONTEXT, EXTRACTOR_CONTEXT y PERSISTENCE_CONTEXT.
@@ -11,21 +14,130 @@
 # Ver la sección "Integración con Docker Compose" del README.
 name: pdf-integracion
 
+configs:
+  # Configuración dinámica de Traefik (file provider): las labels/tags pueden referenciar un
+  # serversTransport, pero no definirlo. Este timeout se aplica solo a los tres servicios internos.
+  traefik-dinamico:
+    content: |
+      http:
+        serversTransports:
+          interno:
+            forwardingTimeouts:
+              responseHeaderTimeout: 8s
+
+  # Registro de los tres servicios internos en Consul (solo en la red backend; MongoDB no se registra
+  # porque es exclusivo de Persistence). Traefik los descubre por consulCatalog leyendo sus tags:
+  # - router solo en el entrypoint interno, para las URLs del Orchestrator traefik:8081/<servicio>;
+  # - circuit breaker propio: se abre si más de la mitad de las respuestas son errores de red
+  #   (502/504: servicio inalcanzable o timeout de 8 s); el 503 del backpressure del Extractor no
+  #   cuenta. Abierto, responde 503 al instante durante 10 s y luego se recupera de a poco en 10 s;
+  # - sin-prefijo: el servicio recibe sus rutas originales (/validate, /api/v1/extraer, /extractions);
+  # - serversTransport interno@file: el timeout de 8 s definido en traefik-dinamico;
+  # - check TCP: si el contenedor se detiene (stop), el check falla y Traefik quita la ruta (404); si
+  #   se congela (pause), el kernel sigue aceptando el handshake TCP y Traefik aplica el timeout (504).
+  consul-servicios:
+    content: |
+      {
+        "services": [
+          {
+            "id": "validator",
+            "name": "validator",
+            "address": "validator",
+            "port": 8000,
+            "tags": [
+              "traefik.enable=true",
+              "traefik.http.routers.validator.rule=PathPrefix(`/validator`)",
+              "traefik.http.routers.validator.entrypoints=interno",
+              "traefik.http.routers.validator.middlewares=validator-circuit-breaker,validator-sin-prefijo",
+              "traefik.http.middlewares.validator-sin-prefijo.stripprefix.prefixes=/validator",
+              "traefik.http.middlewares.validator-circuit-breaker.circuitbreaker.expression=NetworkErrorRatio() > 0.50",
+              "traefik.http.middlewares.validator-circuit-breaker.circuitbreaker.fallbackDuration=10s",
+              "traefik.http.middlewares.validator-circuit-breaker.circuitbreaker.recoveryDuration=10s",
+              "traefik.http.services.validator.loadbalancer.server.port=8000",
+              "traefik.http.services.validator.loadbalancer.serverstransport=interno@file"
+            ],
+            "check": {
+              "tcp": "validator:8000",
+              "interval": "1s",
+              "timeout": "1s"
+            }
+          },
+          {
+            "id": "extractor",
+            "name": "extractor",
+            "address": "extractor",
+            "port": 8000,
+            "tags": [
+              "traefik.enable=true",
+              "traefik.http.routers.extractor.rule=PathPrefix(`/extractor`)",
+              "traefik.http.routers.extractor.entrypoints=interno",
+              "traefik.http.routers.extractor.middlewares=extractor-circuit-breaker,extractor-sin-prefijo",
+              "traefik.http.middlewares.extractor-sin-prefijo.stripprefix.prefixes=/extractor",
+              "traefik.http.middlewares.extractor-circuit-breaker.circuitbreaker.expression=NetworkErrorRatio() > 0.50",
+              "traefik.http.middlewares.extractor-circuit-breaker.circuitbreaker.fallbackDuration=10s",
+              "traefik.http.middlewares.extractor-circuit-breaker.circuitbreaker.recoveryDuration=10s",
+              "traefik.http.services.extractor.loadbalancer.server.port=8000",
+              "traefik.http.services.extractor.loadbalancer.serverstransport=interno@file"
+            ],
+            "check": {
+              "tcp": "extractor:8000",
+              "interval": "1s",
+              "timeout": "1s"
+            }
+          },
+          {
+            "id": "persistence",
+            "name": "persistence",
+            "address": "persistence",
+            "port": 8000,
+            "tags": [
+              "traefik.enable=true",
+              "traefik.http.routers.persistence.rule=PathPrefix(`/persistence`)",
+              "traefik.http.routers.persistence.entrypoints=interno",
+              "traefik.http.routers.persistence.middlewares=persistence-circuit-breaker,persistence-sin-prefijo",
+              "traefik.http.middlewares.persistence-sin-prefijo.stripprefix.prefixes=/persistence",
+              "traefik.http.middlewares.persistence-circuit-breaker.circuitbreaker.expression=NetworkErrorRatio() > 0.50",
+              "traefik.http.middlewares.persistence-circuit-breaker.circuitbreaker.fallbackDuration=10s",
+              "traefik.http.middlewares.persistence-circuit-breaker.circuitbreaker.recoveryDuration=10s",
+              "traefik.http.services.persistence.loadbalancer.server.port=8000",
+              "traefik.http.services.persistence.loadbalancer.serverstransport=interno@file"
+            ],
+            "check": {
+              "tcp": "persistence:8000",
+              "interval": "1s",
+              "timeout": "1s"
+            }
+          }
+        ]
+      }
+
 services:
   traefik:
     image: traefik:v3.6
     command:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
+      - --providers.consulcatalog=true
+      - --providers.consulcatalog.endpoint.address=consul:8500
+      - --providers.consulcatalog.exposedbydefault=false
+      - --providers.consulcatalog.refreshinterval=500ms
+      - --providers.file.filename=/etc/traefik/dinamico.yml
       - --entrypoints.web.address=:80
+      - --entrypoints.interno.address=:8081
       - --log.level=INFO
     ports:
       - "${PUBLIC_PORT:-8080}:80"
+    configs:
+      - source: traefik-dinamico
+        target: /etc/traefik/dinamico.yml
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - edge
+      - backend
     depends_on:
+      consul:
+        condition: service_healthy
       orchestrator:
         condition: service_healthy
     deploy:
@@ -34,12 +146,42 @@ services:
           cpus: "0.5"
           memory: 256M
 
+  consul:
+    image: hashicorp/consul:1.20
+    command:
+      - agent
+      - -dev
+      - -client=0.0.0.0
+    configs:
+      - source: consul-servicios
+        target: /consul/config/servicios.json
+    networks:
+      - backend
+    depends_on:
+      validator:
+        condition: service_healthy
+      extractor:
+        condition: service_healthy
+      persistence:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "consul", "members"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
   orchestrator:
     build: .
     environment:
-      VALIDATOR_URL: http://validator:8000
-      EXTRACTOR_URL: http://extractor:8000
-      PERSISTENCE_URL: http://persistence:8000
+      VALIDATOR_URL: http://traefik:8081/validator
+      EXTRACTOR_URL: http://traefik:8081/extractor
+      PERSISTENCE_URL: http://traefik:8081/persistence
       HTTP_TIMEOUT_SECONDS: "10"
       LOG_LEVEL: INFO
       PORT: "8000"
@@ -115,7 +257,7 @@ services:
 
   persistence:
     build:
-      context: "${PERSISTENCE_CONTEXT:-https://github.com/sharonvicode/pdf-persistence-service.git#95acae239467d8de2b550d1944543536e5d29730}"
+      context: "${PERSISTENCE_CONTEXT:-https://github.com/sharonvicode/pdf-persistence-service.git#3d70c07fc2ad0cede5b9e56e4f1ae438f0168cb7}"
     environment:
       # serverSelectionTimeoutMS: si MongoDB no responde, Persistence falla a los 5 s (antes de
       # escribir) en lugar de los 30 s por defecto de pymongo, que superan el timeout del Orchestrator.
@@ -162,7 +304,7 @@ networks:
   # Traefik y Orchestrator: la única red con un puerto publicado.
   edge:
     name: pdf-integracion-edge
-  # Servicios internos y MongoDB, sin salida a internet.
+  # Traefik (entrypoint interno), Orchestrator, servicios internos y MongoDB, sin salida a internet.
   backend:
     name: pdf-integracion-backend
     internal: true

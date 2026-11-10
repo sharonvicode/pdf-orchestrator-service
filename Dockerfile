@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 # uv fijado a la misma versión usada en desarrollo.
-COPY --from=ghcr.io/astral-sh/uv:0.11.1 /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.7 /uv /bin/uv
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -15,6 +15,9 @@ WORKDIR /app
 # Dependencias primero (capa cacheable). --frozen: instala exactamente uv.lock; --no-dev: sin pytest/ruff.
 COPY pyproject.toml uv.lock .python-version ./
 RUN uv sync --frozen --no-dev --no-install-project
+
+# pip de la imagen base no se usa (uv instala las dependencias) y trae CVEs y un certifi vulnerable.
+RUN pip uninstall -y pip
 
 COPY main.py ./
 COPY app/ ./app/
