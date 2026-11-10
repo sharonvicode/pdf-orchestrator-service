@@ -18,7 +18,7 @@ Persistence    POST /extractions
 MongoDB (solo accesible por Persistence)
 ```
 
-En la integración con Docker Compose, cada llamada del Orchestrator a Validator, Extractor y Persistence pasa por **Traefik**, que aplica un circuit breaker independiente por servicio (ver [Circuit breaker](#circuit-breaker)). El código del Orchestrator no lo sabe: solo cambian sus URLs.
+En la integración con Docker Compose, cada llamada del Orchestrator a Validator, Extractor y Persistence pasa por **Traefik**, que descubre los tres servicios a través de **Consul** (`consulCatalog`) y aplica un circuit breaker independiente por servicio (ver [Circuit breaker](#circuit-breaker)). El código del Orchestrator no lo sabe: solo cambian sus URLs.
 
 ## Responsabilidad
 
@@ -99,10 +99,12 @@ Registro de la revisión del diseño actual: qué se comprobó y qué límites s
 │   ├── api/                    # Endpoints, RFC 9457 y flujo HTTP completo (TestClient)
 │   ├── unit/                   # Caso de uso, adapters, configuración, entrypoint y contrato del Compose de integración
 │   ├── e2e/                    # Prueba de humo contra el stack de integración (Docker)
+│   ├── stress/                 # Escenario k6 (k6-baseline.js) y resultados (results/BASELINE.md)
 │   └── stubs.py                # Dobles de prueba auxiliares
+├── TASKS.md                    # Estado de avance por día (Días 1 a 6) y tareas pendientes
 ├── Dockerfile
 ├── docker-compose.yml          # Solo el Orchestrator (ver sección Docker)
-├── docker-compose.integration.yml  # Sistema completo con Traefik y MongoDB
+├── docker-compose.integration.yml  # Sistema completo con Traefik, Consul y MongoDB
 ├── .dockerignore
 ├── .env.example
 └── pyproject.toml
@@ -296,15 +298,16 @@ Los tests de `tests/unit` y `tests/api` no levantan otros servicios:
 - el caso de uso y los endpoints se prueban con los fakes de `app/adapters/fakes.py` y los dobles de `tests/stubs.py`;
 - los adapters y el flujo completo (`tests/api/test_flujo_http.py`) usan `httpx.MockTransport`, incluido en httpx, para simular las respuestas de cada servicio y verificar los requests, el orden de las llamadas y la ausencia de reintentos.
 
-`tests/unit/test_compose_integracion.py` lee `docker-compose.integration.yml` con PyYAML (dependencia de desarrollo), igual que Traefik lee las labels, y fija la configuración del circuit breaker sin levantar contenedores (ver [Circuit breaker](#circuit-breaker)).
+`tests/unit/test_compose_integracion.py` lee `docker-compose.integration.yml` con PyYAML y `json` (incluyendo las labels de Docker del Orchestrator y el catálogo `consul-servicios` de Consul que consume Traefik) y fija la configuración de descubrimiento y circuit breaker sin levantar contenedores (ver [Circuit breaker](#circuit-breaker)).
 
 `tests/e2e` es la prueba de humo contra el sistema real (ver [Integración con Docker Compose](#integración-con-docker-compose)); sin sus variables de entorno se salta.
 
 ## Docker
 
-**Dockerfile** (`python:3.12-slim` + `uv`):
+**Dockerfile** (`python:3.12-slim` + `uv 0.13.7`):
 
-- instala exactamente `uv.lock` (`uv sync --frozen --no-dev`), sin dependencias de desarrollo;
+- instala exactamente `uv.lock` (`uv sync --frozen --no-dev`, incluyendo `certifi 2026.10.19`), sin dependencias de desarrollo;
+- desinstala `pip` de la imagen base (`pip uninstall -y pip`), eliminando paquetes sin uso y sus CVEs asociados;
 - corre como usuario no-root (`appuser`);
 - arranca con `python main.py`, que valida la configuración y respeta `PORT` y `LOG_LEVEL`;
 - `HEALTHCHECK` contra `GET /health` en el `PORT` configurado.
@@ -328,14 +331,16 @@ host :8080 → traefik (web :80) → orchestrator → traefik (interno :8081) �
 | Servicio | Origen | Red | Healthcheck |
 |----------|--------|-----|-------------|
 | `traefik` | `traefik:v3.6` | `edge` y `backend` | — (lo verifica la prueba de humo con `GET /health`) |
+| `consul` | `hashicorp/consul:1.20` | `backend` | `consul members` |
 | `orchestrator` | este repositorio (`build: .`) | `edge` y `backend` | `GET /health` |
 | `validator` | `pdf-validator-service` @ `79e22ae3e734d05567c50805ac0eab33d3cbdc5b` | `backend` | `GET /health` |
 | `extractor` | `pdf-extract-service` @ `4166ba994cdebf6102f3608774b643bb751d2a4c` | `backend` | `GET /health` |
 | `persistence` | `pdf-persistence-service` @ `3d70c07fc2ad0cede5b9e56e4f1ae438f0168cb7` | `backend` | `GET /openapi.json`: **solo el proceso** (ver abajo) |
 | `mongo` | `mongo:8.0` | `backend` | `db.adminCommand('ping')` |
 
-- **Solo Traefik publica un puerto** (`PUBLIC_PORT`, por defecto `8080`, hacia su entrypoint `web`). Traefik usa el provider Docker con `exposedbydefault=false` y en `web` enruta `PathPrefix(/)` únicamente al Orchestrator, que así responde también los 404 en RFC 9457. La red `backend` es `internal`: los servicios internos no son accesibles desde el host ni tienen salida a internet.
-- **Entrypoint interno de Traefik** (`interno`, puerto `8081`, sin publicar): por ahí el Orchestrator llama a los tres servicios. Solo es alcanzable desde la red de Docker.
+- **Solo Traefik publica un puerto** (`PUBLIC_PORT`, por defecto `8080`, hacia su entrypoint `web`). Traefik usa el provider Docker con `exposedbydefault=false` para exponer en `web` (`PathPrefix(/)`) únicamente al Orchestrator, que así responde también los 404 en RFC 9457. La red `backend` es `internal`: los servicios internos, Consul y MongoDB no son accesibles desde el host ni tienen salida a internet.
+- **Registro y descubrimiento con Consul**: `consul` corre en la red `backend` (`agent -dev -client=0.0.0.0`, sin publicar puertos) y carga desde `configs` (`consul-servicios`, montado en `/consul/config/servicios.json`) el registro de `validator`, `extractor` y `persistence` (hostname, puerto `8000`, `tags` de Traefik y check TCP cada `1s`). MongoDB no se registra en Consul porque es responsabilidad exclusiva de Persistence. Traefik descubre los tres servicios mediante su provider `consulCatalog` (`--providers.consulcatalog.endpoint.address=consul:8500`, `exposedbydefault=false`, `refreshinterval=500ms`), sin requerir cambios en el código de ningún microservicio.
+- **Entrypoint interno de Traefik** (`interno`, puerto `8081`, sin publicar): por ahí el Orchestrator llama a los tres servicios descubiertos en Consul. Solo es alcanzable desde la red de Docker.
 - **URLs internas por nombre de servicio**, nunca `localhost`: `http://traefik:8081/validator`, `http://traefik:8081/extractor`, `http://traefik:8081/persistence` y `mongodb://mongo:27017/?serverSelectionTimeoutMS=5000`. El `serverSelectionTimeoutMS` hace que Persistence falle en 5 s, antes de escribir, si MongoDB no responde; sin él pymongo espera 30 s, más que el timeout del Orchestrator.
 - **Datos de integración aislados**: base `pdf_extractext_integracion` y volumen `pdf-integracion-mongo-data`.
 - **Una réplica por servicio**, con límites pensados para una máquina de 4 núcleos y ~4 GB para Docker (en total ~4 CPU y ~2.7 GB de techo). El Compose del Extractor, con 5 réplicas y su propio Traefik, no se usa.
@@ -357,7 +362,7 @@ Si un servicio deja de responder, Traefik **deja de mandarle pedidos por un tiem
 Lo maneja **Traefik**, no el código Python, igual que en el Compose del Extractor. Se configura en `docker-compose.integration.yml`:
 
 - **Entrypoint interno** `interno` (`--entrypoints.interno.address=:8081`), sin publicar en el host.
-- **Por servicio**, con labels en Validator, Extractor y Persistence: un router `PathPrefix(/<servicio>)` solo en `interno`, un middleware `<servicio>-circuit-breaker`, un middleware `<servicio>-sin-prefijo` que quita el prefijo (el servicio recibe sus rutas originales) y el `serversTransport` `interno@file`.
+- **Por servicio**, con `tags` en su registro de Consul (`consul-servicios`): un router `PathPrefix(/<servicio>)` solo en `interno`, un middleware `<servicio>-circuit-breaker`, un middleware `<servicio>-sin-prefijo` que quita el prefijo (el servicio recibe sus rutas originales) y el `serversTransport` `interno@file`.
 - **Timeout**: el `serversTransport` `interno` se define con un file provider cuyo contenido está inline en `configs` del mismo Compose, porque las labels de Docker pueden referenciar un `serversTransport` pero no definirlo. No se usa `--serversTransport.forwardingTimeouts.responseHeaderTimeout` global, como en el Compose del Extractor, porque también cortaría el salto público Cliente → Traefik → Orchestrator antes de que el Orchestrator responda su Problem Details.
 
 ```
@@ -376,7 +381,7 @@ CERRADO ──más del 50% de errores de red──► ABIERTO ──10 s──�
 - **Independientes**: cada servicio tiene su propio middleware y su propio router. Con el circuito del Validator abierto, Extractor y Persistence siguen respondiendo `200` (verificado en la prueba de humo).
 - **Backpressure del Extractor**: su `503` intencional (cola llena, `application/problem+json` con `Retry-After`) no es un error de red y **no abre el circuito**. Se verificó con una ráfaga de 150 pedidos concurrentes a `traefik:8081/extractor/api/v1/extraer`: 105 respondieron `503` del Extractor (70 %, más que el umbral) y 45 `200`, sin ningún `504`. Inmediatamente después, `GET /extractor/health` respondió `200` en ~12 ms y Traefik no registró ningún cambio de estado del circuito.
 - **Límite conocido**: un pedido que espere en la cola del Extractor más de 8 s recibe el `504` de Traefik, y ese sí cuenta. En la ráfaga anterior ningún pedido llegó a 8 s (el más lento tardó ~5 s); con PDFs más pesados podría pasar.
-- **`stop` y `pause` no son lo mismo.** Con `docker compose stop`, Traefik deja de descubrir el contenedor, borra su ruta y responde `404` sin pasar por el circuit breaker. Con `docker compose pause`, el kernel sigue aceptando la conexión, Traefik corta con `504` a los 8 s y el circuito se abre. La label `traefik.docker.allownonrunning=true`, que según la documentación respondería `503` con el contenedor detenido, **se descartó**: en Traefik v3.6.25 respondió `500` (`unsupported protocol scheme ""`), que tampoco cuenta para el circuito.
+- **`stop` y `pause` no son lo mismo.** Con `docker compose stop`, el check TCP de Consul falla (`critical`), Traefik deja de descubrir el contenedor en `consulCatalog`, borra su ruta y responde `404` sin pasar por el circuit breaker. Con `docker compose pause`, el kernel sigue aceptando la conexión TCP, Traefik corta con `504` a los 8 s y el circuito se abre. La label `traefik.docker.allownonrunning=true`, que según la documentación respondería `503` con el contenedor detenido, **se descartó**: en Traefik v3.6.25 respondió `500` (`unsupported protocol scheme ""`), que tampoco cuenta para el circuito.
 - La traducción al cliente de estas respuestas está en [Respuestas de Traefik](#respuestas-de-traefik-y-su-traducción).
 
 **Cómo comprobarlo** con el stack levantado (ejemplo con el Validator; vale igual para `extractor` y `persistence`). La sonda hace un `GET` desde el contenedor del Orchestrator, porque el entrypoint interno no está publicado:
@@ -450,9 +455,57 @@ uv run pytest -m e2e -v
 | `test_con_validator_pausado_traefik_corta_a_los_8s_y_el_orchestrator_responde_502_sin_escribir` | `docker compose pause validator` → `502` entre 8 y 10 s (cortó Traefik, no el Orchestrator), conteo sin cambios; luego `unpause validator` y espera a que su circuito se cierre | No |
 | `test_traefik_publica_solo_el_entrypoint_web` | Traefik publica solo el puerto `80`; el entrypoint interno no | No |
 | `test_cada_servicio_responde_a_traves_del_entrypoint_interno` | `traefik:8081/<servicio>/openapi.json` llega a cada servicio, sin el prefijo | No |
+| `test_consul_registra_solo_los_tres_servicios_saludables` | Consul registra únicamente `validator`, `extractor` y `persistence` en `:8000` con estado `passing` | No |
 | `test_circuit_breaker_se_abre_rechaza_sin_escribir_y_se_recupera` | Por servicio, con `pause`: `504` de Traefik entre 8 y 10 s, luego `503` en menos de 1 s, los otros dos circuitos en `200`, el cliente rechazado sin esperar un timeout (`503` Validator/Extractor, `502` Persistence), conteo sin cambios y `200` de nuevo entre 9 y 35 s | No |
 
 Cada corrida escribe **exactamente un documento** y tarda ~4.5 min, casi todo esperando que los circuitos se recuperen. Las consultas internas se hacen desde el contenedor del Orchestrator con `docker compose exec`, sin publicar puertos. El circuito de Persistence se abre con un `GET` de solo lectura: un `POST` quedaría encolado en el contenedor pausado y podría escribir al reanudarlo.
+
+### Baseline de rendimiento (k6) — Día 4
+
+El escenario de k6 contra `POST /extraer` se encuentra en `tests/stress/k6-baseline.js` y el detalle completo de condiciones, comandos, percentiles de latencia y uso de CPU/RAM está en [`tests/stress/results/BASELINE.md`](./tests/stress/results/BASELINE.md):
+
+| Escenario | VUs / Duración | Requests | Throughput | `avg` | `p50` | `p90` | `p95` | `p99` | % Errores |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Baja concurrencia | `2 VUs` / `15s` | `146` | `9.66 req/s` | `205.40 ms` | `162.00 ms` | `295.22 ms` | `356.17 ms` | `1.06 s` | `0.00 %` |
+| Concurrencia media | `10 VUs` / `15s` | `178` | `11.46 req/s` | `855.83 ms` | `766.30 ms` | `1.11 s` | `1.50 s` | `1.72 s` | `0.00 %` |
+
+**Consumo de recursos observado (`docker stats` en régimen):**
+
+- **Extractor:** ~`95 %` de CPU en baja concurrencia (`2 VUs`) y ~`97 %` en concurrencia media (`10 VUs`), con ~`102–107 MiB` de RAM.
+- **MongoDB:** ~`4 %` de CPU en baja concurrencia (`2 VUs`) y ~`101 %` en concurrencia media (`10 VUs`), con ~`369–536 MiB` de RAM.
+- **Orchestrator:** ~`27 %` y ~`22 %` de CPU respectivamente (~`50–56 MiB` de RAM).
+- **Resto de los servicios** (`traefik`, `validator`, `consul`, `persistence`): consumos inferiores (~`4 %` a ~`16 %` de CPU).
+
+### Evaluación de caché y optimización — Día 5
+
+A partir de las mediciones de k6 y `docker stats`, se evaluó la incorporación de **Redis** o **Dragonfly** como caché:
+
+1. **Dónde está el consumo:** el mayor consumo de CPU y memoria corresponde principalmente al **Extractor** (~`95 %`–`97 %` de CPU extrayendo texto del PDF) y a **MongoDB** (~`101 %` de CPU en concurrencia media), **no al Orchestrator** (~`22 %`–`27 %` de CPU).
+2. **Ausencia de caso de uso concreto en el Orchestrator:** el Orchestrator solo coordina `Validator` → `Extractor` → `Persistence` y cada `POST /extraer` debe persistir una nueva extracción y devolver su `id` único generado por Persistence.
+3. **Conclusión:** **no se justifica implementar caché (ni Redis ni Dragonfly) por ahora**, ya que no se identificó un caso concreto que demuestre su necesidad o beneficio y sumaría infraestructura innecesaria (ver fila `YAGNI` en [Revisión de principios](#revisión-de-principios-solid-kiss-dry-yagni)).
+
+### Concurrencia, cuellos de botella y escalabilidad — Día 6
+
+1. **Comparación de `2 VUs` vs. `10 VUs` (`15 s`):**
+   - Al quintuplicar los usuarios concurrentes, el throughput pasó de `9.66 req/s` (`146` requests) a `11.46 req/s` (`178` requests), mientras que el tiempo de respuesta promedio subió de `205.40 ms` a `855.83 ms` y el percentil `p95` de `356.17 ms` a `1.50 s`, con **`0 %` de errores** en ambos escenarios.
+2. **Cuellos de botella observados:**
+   - **Extractor (`1.0 CPU`, 1 instancia, `EXTRACTION_CONCURRENCY=1`):** opera al ~`95 %`–`97 %` de CPU en ambos escenarios y encola los pedidos concurrentes (`EXTRACTION_QUEUE_SIZE=20`), fijando el techo de throughput de una sola instancia en ~`11.5 req/s` y elevando la latencia de espera en cola.
+   - **MongoDB (`1.0 CPU`):** alcanza ~`101 %` de CPU en concurrencia media (`10 VUs`).
+   - **Orchestrator:** **no aparece como el principal cuello de botella** en los escenarios probados (~`27 %` y ~`22 %` de CPU, ~`50–56 MiB` de RAM).
+3. **Evaluación de routing y descubrimiento:**
+   - La arquitectura de routing público e interno mediante **Traefik (`v3.6`)** (con Circuit Breakers independientes por servicio) y el descubrimiento de servicios mediante **Consul (`hashicorp/consul:1.20`)** (`consulCatalog`) funcionaron sin errores y con bajo consumo de CPU (~`14–16 %` y ~`4–6 %`).
+4. **Alcance y pruebas pendientes:**
+   - Estas conclusiones se limitan exclusivamente a los escenarios de `2 VUs` y `10 VUs` efectivamente probados; **no se afirma que el sistema esté optimizado para cualquier nivel de concurrencia**.
+   - Quedan **pendientes** las pruebas adicionales de escalabilidad (como aumentar instancias/réplicas o workers y medir su impacto).
+
+### Verificación final — Día 7
+
+- **Suite unitaria y API (`pytest tests/unit tests/api`):** `216 passed`, `0 failed`.
+- **Suite E2E (`pytest -m e2e -v`):** `18 passed` (`12` funciones de prueba, `0 failed`, escribiendo `1` único documento por corrida en `pdf_extractext_integracion.extractions`).
+- **Calidad y formato (`ruff check` / `ruff format --check`):** `0` errores en los `37` archivos del proyecto.
+- **Comparación con la baseline de carga:** las pruebas de k6 del Día 4 (`2 VUs` y `10 VUs` durante `15 s`) ya fueron ejecutadas sobre la configuración final actual (con `uv 0.13.7`, `certifi 2026.10.19`, sin `pip`, con Consul, Traefik `v3.6` y los tres Circuit Breakers). Al no haber cambios posteriores en el código ni en la infraestructura, la baseline representa directamente la configuración final y no se repitieron corridas de carga para evitar escrituras redundantes en MongoDB.
+- **Redis / Dragonfly:** no aplicable (descartado en el Día 5; sin dependencias ni referencias en el código ni en los archivos de configuración).
+- **Revisión de logs:** `0` excepciones no controladas ni errores de comunicación reales en los 7 contenedores; los registros `415`/`502`/`503` del Orchestrator y `WRN CircuitBreaker(state=tripped/recovering)` de Traefik provienen exclusivamente de los casos negativos y de resiliencia de las pruebas E2E.
 
 ### Detener
 
@@ -464,8 +517,12 @@ docker compose -f docker-compose.integration.yml down       # conserva el volume
 
 ## Pendiente
 
-- ~~**Ejecutar la integración en una máquina con Docker**~~ (completado): se levantó el entorno de `docker-compose.integration.yml` y las 10 pruebas E2E pasaron.
+El seguimiento detallado por día se encuentra en [`TASKS.md`](./TASKS.md).
+
+- ~~**Ejecutar la integración en una máquina con Docker**~~ (completado): se levantó el entorno de `docker-compose.integration.yml` y pasaron las 12 funciones de prueba E2E (`18` casos en total, incluyendo Consul y los tres Circuit Breakers).
 - ~~**Confirmar el timeout** de 10 s con el sistema real~~ (completado): se verificó contra el stack real que, con el Validator sin responder, el Orchestrator devolvía `504` entre 10 y 15 s sin escribir en MongoDB. Con el circuit breaker, Traefik corta antes, a los 8 s (ver [Timeout](#timeout)). No se midieron PDFs más pesados.
-- ~~**Circuit breaker**~~ (completado): tres circuit breakers independientes en Traefik, verificados contra el stack real (ver [Circuit breaker](#circuit-breaker)).
+- ~~**Circuit breaker y descubrimiento con Consul**~~ (completado): tres circuit breakers independientes en Traefik con servicios registrados y descubiertos en Consul, verificados contra el stack real (ver [Circuit breaker](#circuit-breaker)).
+- ~~**Baseline de rendimiento (Día 4) y evaluación de caché (Día 5)**~~ (completado): mediciones con k6 (`2 VUs` y `10 VUs`) documentadas en [`tests/stress/results/BASELINE.md`](./tests/stress/results/BASELINE.md); la implementación de caché (Redis / Dragonfly) se descartó por ahora al no estar justificada.
+- **Pruebas adicionales de escalabilidad (Día 6)**: aumentar instancias/réplicas o workers (especialmente del Extractor) y evaluar límites de recursos de MongoDB para medir su impacto bajo mayor concurrencia.
 - **Traducir las respuestas de Traefik en los adapters** (requiere cambiar código Python; no se hizo para mantener el circuit breaker solo en infraestructura): hoy el `504` de Traefik llega al cliente como `502` en lugar de `504`, el `503` del circuito de Persistence como `502` en lugar de `503`, y Persistence detenido como `502` en lugar del `503` que daba antes de Traefik (ver [Respuestas de Traefik](#respuestas-de-traefik-y-su-traducción)).
 - **Medir la cola del Extractor con PDFs pesados**: un pedido encolado más de 8 s recibe `504` de Traefik y cuenta para el circuit breaker.

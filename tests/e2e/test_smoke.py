@@ -60,7 +60,9 @@ RECUPERACION = 10  # recoveryDuration
 
 
 def compose(*argumentos: str) -> str:
-    resultado = subprocess.run([*COMPOSE, *argumentos], capture_output=True, text=True, encoding="utf-8", check=True, timeout=120)
+    resultado = subprocess.run(
+        [*COMPOSE, *argumentos], capture_output=True, text=True, encoding="utf-8", check=True, timeout=120
+    )
     return resultado.stdout.strip()
 
 
@@ -224,12 +226,13 @@ def test_txt_rechazado_por_el_validator_sin_escribir():
 
 
 def test_con_persistence_detenido_traefik_responde_404_y_el_orchestrator_502_sin_escribir():
-    # Con el contenedor detenido, Traefik deja de descubrirlo y borra su ruta: responde 404 sin pasar
-    # por el circuit breaker. El adapter de Persistence trata toda respuesta distinta de 201 como
-    # fuera de contrato (502). Antes de Traefik el Orchestrator fallaba al conectar y respondía 503.
+    # Con el contenedor detenido, el check TCP de Consul falla (cada 1 s) y Traefik deja de
+    # descubrirlo y borra su ruta: responde 404 sin pasar por el circuit breaker. El adapter de
+    # Persistence trata toda respuesta distinta de 201 como fuera de contrato (502).
     antes = contar_extracciones()
     compose("stop", "persistence")
     try:
+        esperar_status(f"{TRAEFIK_INTERNO}/persistence/openapi.json", 404, 5)
         status_traefik, _ = get_interno(f"{TRAEFIK_INTERNO}/persistence/openapi.json")
         response = subir(PDF.name, PDF.read_bytes(), "application/pdf")
     finally:
@@ -288,11 +291,24 @@ def test_traefik_publica_solo_el_entrypoint_web():
 
 @pytest.mark.parametrize(("servicio", "ruta"), zip(SERVICIOS, CONTRATOS.values()))
 def test_cada_servicio_responde_a_traves_del_entrypoint_interno(servicio, ruta):
-    # Traefik quita el prefijo /<servicio>: el servicio recibe sus rutas originales.
+    # Traefik descubre cada servicio desde Consul y quita el prefijo /<servicio>.
     status, cuerpo = get_interno(f"{TRAEFIK_INTERNO}/{servicio}/openapi.json")
 
     assert status == 200
     assert "post" in json.loads(cuerpo)["paths"][ruta]
+
+
+def test_consul_registra_solo_los_tres_servicios_saludables():
+    status_servicios, cuerpo_servicios = get_interno("http://consul:8500/v1/agent/services")
+    status_checks, cuerpo_checks = get_interno("http://consul:8500/v1/agent/checks")
+
+    assert status_servicios == 200
+    assert status_checks == 200
+    servicios = json.loads(cuerpo_servicios)
+    checks = json.loads(cuerpo_checks)
+    assert set(servicios) == set(SERVICIOS)
+    assert {s["Address"]: s["Port"] for s in servicios.values()} == {s: 8000 for s in SERVICIOS}
+    assert {c["ServiceName"]: c["Status"] for c in checks.values()} == {s: "passing" for s in SERVICIOS}
 
 
 # Respuesta del Orchestrator al cliente con el circuito del servicio abierto (Traefik responde 503).
