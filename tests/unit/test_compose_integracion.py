@@ -1,9 +1,9 @@
 """Contrato de docker-compose.integration.yml: Consul, Traefik y circuit breakers.
 
 El Orchestrator llama a Validator, Extractor y Persistence a través de un entrypoint interno
-de Traefik. Los tres servicios se registran en Consul y Traefik los descubre mediante su
-provider consulCatalog, aplicando a cada uno su propio circuit breaker. Estos tests leen el
-compose y sus configs inline igual que Consul y Traefik, sin levantar contenedores.
+de Traefik. Los tres servicios se autorregistran dinámicamente en Consul al iniciar y Traefik
+los descubre mediante su provider consulCatalog, aplicando a cada uno su propio circuit breaker.
+Estos tests leen el compose y sus configs inline sin levantar contenedores.
 """
 
 import json
@@ -16,10 +16,15 @@ import yaml
 
 COMPOSE_FILE = Path(__file__).parents[2] / "docker-compose.integration.yml"
 SERVICIOS = ("validator", "extractor", "persistence")
+SHAS_ESPERADOS = {
+    "validator": "43fbc5f2037b8a6d18eb4bc585d896b3d4a21c69",
+    "extractor": "fbb9069067cd66060ae6f0820658ccb7ebe796d4",
+    "persistence": "11f59f5af8196328c743502616e6ce8eea4e57c5",
+}
 ENTRYPOINT_INTERNO = "interno"
 SERVERS_TRANSPORT = "interno"
 RED_INTERNA = "pdf-integracion-backend"
-ARCHIVO_CONSUL = "/consul/config/servicios.json"
+CONSUL_URL_ESPERADA = "http://consul:8500"
 
 
 @pytest.fixture(scope="module")
@@ -43,17 +48,20 @@ def opcion(comando: list[str], nombre: str) -> str | None:
     return next((arg.removeprefix(prefijo) for arg in comando if arg.startswith(prefijo)), None)
 
 
-def servicios_consul(compose: dict) -> dict[str, dict]:
-    """Servicios registrados en el config inline de Consul, indexados por nombre."""
-    montaje = next(c for c in compose["services"]["consul"].get("configs", []) if c["target"] == ARCHIVO_CONSUL)
-    contenido = json.loads(compose["configs"][montaje["source"]]["content"])
-    return {s["name"]: s for s in contenido["services"]}
+def tags_consul(compose: dict, servicio: str) -> list[str]:
+    """Tags de Consul declarados como JSON en CONSUL_SERVICE_TAGS del servicio."""
+    entorno = compose["services"][servicio].get("environment", {})
+    raw = entorno.get("CONSUL_SERVICE_TAGS")
+    assert isinstance(raw, str), f"{servicio} debe definir CONSUL_SERVICE_TAGS como JSON string"
+    tags = json.loads(raw)
+    assert isinstance(tags, list) and all(isinstance(t, str) and "=" in t for t in tags)
+    return tags
 
 
 def labels(compose: dict, servicio: str) -> dict[str, str]:
-    """Etiquetas de Traefik: de Consul (tags) para los tres servicios internos y de Docker para el resto."""
+    """Etiquetas de Traefik: de CONSUL_SERVICE_TAGS para los tres servicios internos y de Docker para el resto."""
     if servicio in SERVICIOS:
-        entradas = servicios_consul(compose)[servicio].get("tags", [])
+        entradas = tags_consul(compose, servicio)
     else:
         entradas = compose["services"][servicio].get("labels", [])
     return dict(etiqueta.split("=", 1) for etiqueta in entradas)
@@ -147,15 +155,12 @@ class TestRouterInterno:
         assert prefijos == {f"/{servicio}"}
 
     @pytest.mark.parametrize("servicio", SERVICIOS)
-    def test_el_servicio_se_alcanza_por_la_red_interna_en_el_puerto_8000(self, compose, servicio):
+    def test_el_servicio_se_alcanza_por_la_red_interna_con_puerto_de_consul(self, compose, servicio):
         etiquetas = labels(compose, servicio)
-        registro = servicios_consul(compose)[servicio]
 
         assert "backend" in compose["services"][servicio]["networks"]
         assert compose["networks"]["backend"]["name"] == RED_INTERNA
-        assert registro["address"] == servicio
-        assert registro["port"] == 8000
-        assert etiquetas[f"traefik.http.services.{servicio}.loadbalancer.server.port"] == "8000"
+        assert f"traefik.http.services.{servicio}.loadbalancer.server.port" not in etiquetas
 
 
 class TestConsul:
@@ -165,24 +170,58 @@ class TestConsul:
         assert consul["networks"] == ["backend"]
         assert "ports" not in consul
 
-    def test_solo_se_registran_validator_extractor_y_persistence(self, compose):
+    def test_consul_no_tiene_registro_estatico_ni_depende_de_los_microservicios(self, compose):
+        consul = compose["services"]["consul"]
+
+        assert "consul-servicios" not in compose.get("configs", {})
+        assert "configs" not in consul
+        assert "depends_on" not in consul
+
+    def test_solo_se_autorregistran_validator_extractor_y_persistence(self, compose):
         # MongoDB sigue siendo responsabilidad exclusiva de Persistence y no se registra en Consul.
-        assert set(servicios_consul(compose)) == set(SERVICIOS)
+        con_consul = {
+            nombre
+            for nombre, cfg in compose["services"].items()
+            if any(k.startswith("CONSUL_") for k in cfg.get("environment", {}))
+        }
+
+        assert con_consul == set(SERVICIOS)
 
     @pytest.mark.parametrize("servicio", SERVICIOS)
-    def test_cada_servicio_tiene_check_tcp_en_consul(self, compose, servicio):
-        check = servicios_consul(compose)[servicio]["check"]
+    def test_cada_servicio_tiene_configurado_el_autorregistro_en_consul(self, compose, servicio):
+        servicio_cfg = compose["services"][servicio]
+        entorno = servicio_cfg["environment"]
+        dependencias = servicio_cfg["depends_on"]
 
-        assert check["tcp"] == f"{servicio}:8000"
+        assert entorno["CONSUL_URL"] == CONSUL_URL_ESPERADA
+        assert tags_consul(compose, servicio)
+        assert dependencias["consul"] == {"condition": "service_healthy"}
+
+    def test_persistence_conserva_su_dependencia_de_mongo_healthy(self, compose):
+        dependencias = compose["services"]["persistence"]["depends_on"]
+
+        assert dependencias["mongo"] == {"condition": "service_healthy"}
 
     def test_traefik_descubre_los_servicios_mediante_consul_catalog(self, comando_traefik):
+        assert opcion(comando_traefik, "providers.docker") == "true"
+        assert opcion(comando_traefik, "providers.docker.exposedbydefault") == "false"
         assert opcion(comando_traefik, "providers.consulcatalog") == "true"
         assert opcion(comando_traefik, "providers.consulcatalog.endpoint.address") == "consul:8500"
         assert opcion(comando_traefik, "providers.consulcatalog.exposedbydefault") == "false"
+        assert opcion(comando_traefik, "providers.consulcatalog.refreshinterval") == "500ms"
 
     @pytest.mark.parametrize("servicio", SERVICIOS)
     def test_los_servicios_internos_no_se_descubren_por_docker_labels(self, compose, servicio):
         assert "labels" not in compose["services"][servicio]
+
+
+class TestVersionesDeMicroservicios:
+    @pytest.mark.parametrize(("servicio", "sha"), SHAS_ESPERADOS.items())
+    def test_cada_microservicio_fija_el_sha_confirmado(self, compose, servicio, sha):
+        contexto = compose["services"][servicio]["build"]["context"]
+
+        assert len(sha) == 40
+        assert contexto.endswith(f".git#{sha}}}")
 
 
 class TestCircuitBreaker:
@@ -217,6 +256,13 @@ class TestCircuitBreaker:
 
         assert opciones["fallbackDuration"] == "10s"
         assert opciones["recoveryDuration"] == "10s"
+
+    @pytest.mark.parametrize("servicio", SERVICIOS)
+    def test_se_aplica_antes_de_quitar_el_prefijo(self, compose, servicio):
+        etiquetas = labels(compose, servicio)
+        middlewares = etiquetas[f"traefik.http.routers.{servicio}.middlewares"].split(",")
+
+        assert middlewares == [f"{servicio}-circuit-breaker", f"{servicio}-sin-prefijo"]
 
     def test_cada_servicio_tiene_su_propio_circuit_breaker(self, compose):
         nombres = {self.circuit_breaker(compose, servicio)[0] for servicio in SERVICIOS}

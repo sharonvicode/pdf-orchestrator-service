@@ -226,13 +226,13 @@ def test_txt_rechazado_por_el_validator_sin_escribir():
 
 
 def test_con_persistence_detenido_traefik_responde_404_y_el_orchestrator_502_sin_escribir():
-    # Con el contenedor detenido, el check TCP de Consul falla (cada 1 s) y Traefik deja de
-    # descubrirlo y borra su ruta: responde 404 sin pasar por el circuit breaker. El adapter de
-    # Persistence trata toda respuesta distinta de 201 como fuera de contrato (502).
+    # Al detenerse con SIGTERM, Persistence se desregistra de Consul (y si no llegara, falla su
+    # healthcheck HTTP) y Traefik borra su ruta: responde 404 sin pasar por el circuit breaker.
+    # El adapter de Persistence trata toda respuesta distinta de 201 como fuera de contrato (502).
     antes = contar_extracciones()
     compose("stop", "persistence")
     try:
-        esperar_status(f"{TRAEFIK_INTERNO}/persistence/openapi.json", 404, 5)
+        esperar_status(f"{TRAEFIK_INTERNO}/persistence/openapi.json", 404, 15)
         status_traefik, _ = get_interno(f"{TRAEFIK_INTERNO}/persistence/openapi.json")
         response = subir(PDF.name, PDF.read_bytes(), "application/pdf")
     finally:
@@ -306,8 +306,8 @@ def test_consul_registra_solo_los_tres_servicios_saludables():
     assert status_checks == 200
     servicios = json.loads(cuerpo_servicios)
     checks = json.loads(cuerpo_checks)
-    assert set(servicios) == set(SERVICIOS)
-    assert {s["Address"]: s["Port"] for s in servicios.values()} == {s: 8000 for s in SERVICIOS}
+    assert {s["Service"]: s["Port"] for s in servicios.values()} == {s: 8000 for s in SERVICIOS}
+    assert all(s["Address"] for s in servicios.values())
     assert {c["ServiceName"]: c["Status"] for c in checks.values()} == {s: "passing" for s in SERVICIOS}
 
 
@@ -322,27 +322,51 @@ RECHAZO_CON_CIRCUITO_ABIERTO = {
 }
 
 
+def abrir_circuit_breaker(servicio: str, ruta: str) -> tuple[int, float, float, int, float]:
+    """Pausa el servicio lo mínimo para que Traefik corte con 504 (8 s) y abra el circuito.
+
+    Se reanuda apenas se abre el circuito para que siga respondiendo /health a Consul (cada 10 s,
+    timeout 5 s). Si el check HTTP de Consul venció durante la pausa y marcó el servicio como
+    critical (Traefik retira la ruta y responde 404 en vez de 503), se espera a que vuelva a
+    passing —sincronizando la ventana de 10 s de Consul— y se reintenta una vez.
+    """
+    for intento in range(2):
+        pausado = False
+        try:
+            compose("pause", servicio)
+            pausado = True
+            status_apertura, segundos_apertura, _ = sondear(ruta)
+            abierto_desde = time.monotonic()
+        finally:
+            if pausado:
+                compose("unpause", servicio)
+        status_abierto, segundos_abierto, _ = sondear(ruta)
+        if (status_apertura == 504 and status_abierto == 503) or intento == 1:
+            return status_apertura, segundos_apertura, abierto_desde, status_abierto, segundos_abierto
+        esperar_healthy(servicio)
+        esperar_alcanzable(servicio)
+    raise AssertionError("unreachable")
+
+
 @pytest.mark.parametrize("servicio", SERVICIOS)
 def test_circuit_breaker_se_abre_rechaza_sin_escribir_y_se_recupera(servicio):
-    # `pause` (no `stop`): con el contenedor detenido Traefik borra la ruta y responde 404, sin
-    # pasar por el circuit breaker. Pausado, el kernel acepta la conexión y Traefik corta con 504
-    # al vencer su timeout: un error de red que abre el circuito.
+    # `pause` (no `stop`): con el contenedor detenido se desregistra de Consul y Traefik borra la
+    # ruta (404), sin pasar por el circuit breaker. Pausado, el kernel acepta la conexión y Traefik
+    # corta con 504 al vencer su timeout (8 s): un error de red que abre el circuito.
     # El circuito se abre con un GET de solo lectura: un POST a Persistence quedaría encolado en el
     # contenedor pausado y podría escribir al reanudarlo, aunque el cliente ya recibió el error.
     ruta = f"{TRAEFIK_INTERNO}/{servicio}/openapi.json"
     otros = [f"{TRAEFIK_INTERNO}/{otro}/openapi.json" for otro in SERVICIOS if otro != servicio]
     antes = contar_extracciones()
     try:
-        compose("pause", servicio)
-        status_apertura, segundos_apertura, _ = sondear(ruta)
-        abierto_desde = time.monotonic()
-        status_abierto, segundos_abierto, _ = sondear(ruta)
+        status_apertura, segundos_apertura, abierto_desde, status_abierto, segundos_abierto = abrir_circuit_breaker(
+            servicio, ruta
+        )
         status_otros = [sondear(url)[0] for url in otros]
         inicio = time.monotonic()
         response = subir(PDF.name, PDF.read_bytes(), "application/pdf")
         duracion = time.monotonic() - inicio
     finally:
-        compose("unpause", servicio)
         esperar_healthy(servicio)
     recuperado_a_los = time.monotonic() - abierto_desde + esperar_status(ruta, 200, VENTANA_ABIERTO + RECUPERACION + 15)
 

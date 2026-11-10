@@ -298,7 +298,7 @@ Los tests de `tests/unit` y `tests/api` no levantan otros servicios:
 - el caso de uso y los endpoints se prueban con los fakes de `app/adapters/fakes.py` y los dobles de `tests/stubs.py`;
 - los adapters y el flujo completo (`tests/api/test_flujo_http.py`) usan `httpx.MockTransport`, incluido en httpx, para simular las respuestas de cada servicio y verificar los requests, el orden de las llamadas y la ausencia de reintentos.
 
-`tests/unit/test_compose_integracion.py` lee `docker-compose.integration.yml` con PyYAML y `json` (incluyendo las labels de Docker del Orchestrator y el catálogo `consul-servicios` de Consul que consume Traefik) y fija la configuración de descubrimiento y circuit breaker sin levantar contenedores (ver [Circuit breaker](#circuit-breaker)).
+`tests/unit/test_compose_integracion.py` lee `docker-compose.integration.yml` con PyYAML y `json` (incluyendo las labels de Docker del Orchestrator, las variables de autorregistro `CONSUL_URL` / `CONSUL_SERVICE_TAGS` de los tres servicios internos y los providers de Traefik) y fija la configuración de descubrimiento dinámico y circuit breaker sin levantar contenedores (ver [Circuit breaker](#circuit-breaker)).
 
 `tests/e2e` es la prueba de humo contra el sistema real (ver [Integración con Docker Compose](#integración-con-docker-compose)); sin sus variables de entorno se salta.
 
@@ -333,13 +333,18 @@ host :8080 → traefik (web :80) → orchestrator → traefik (interno :8081) �
 | `traefik` | `traefik:v3.6` | `edge` y `backend` | — (lo verifica la prueba de humo con `GET /health`) |
 | `consul` | `hashicorp/consul:1.20` | `backend` | `consul members` |
 | `orchestrator` | este repositorio (`build: .`) | `edge` y `backend` | `GET /health` |
-| `validator` | `pdf-validator-service` @ `79e22ae3e734d05567c50805ac0eab33d3cbdc5b` | `backend` | `GET /health` |
-| `extractor` | `pdf-extract-service` @ `4166ba994cdebf6102f3608774b643bb751d2a4c` | `backend` | `GET /health` |
-| `persistence` | `pdf-persistence-service` @ `3d70c07fc2ad0cede5b9e56e4f1ae438f0168cb7` | `backend` | `GET /openapi.json`: **solo el proceso** (ver abajo) |
+| `validator` | `pdf-validator-service` @ `43fbc5f2037b8a6d18eb4bc585d896b3d4a21c69` | `backend` | `GET /health` |
+| `extractor` | `pdf-extract-service` @ `fbb9069067cd66060ae6f0820658ccb7ebe796d4` | `backend` | `GET /health` |
+| `persistence` | `pdf-persistence-service` @ `11f59f5af8196328c743502616e6ce8eea4e57c5` | `backend` | `GET /openapi.json`: **solo el proceso** (ver abajo) |
 | `mongo` | `mongo:8.0` | `backend` | `db.adminCommand('ping')` |
 
-- **Solo Traefik publica un puerto** (`PUBLIC_PORT`, por defecto `8080`, hacia su entrypoint `web`). Traefik usa el provider Docker con `exposedbydefault=false` para exponer en `web` (`PathPrefix(/)`) únicamente al Orchestrator, que así responde también los 404 en RFC 9457. La red `backend` es `internal`: los servicios internos, Consul y MongoDB no son accesibles desde el host ni tienen salida a internet.
-- **Registro y descubrimiento con Consul**: `consul` corre en la red `backend` (`agent -dev -client=0.0.0.0`, sin publicar puertos) y carga desde `configs` (`consul-servicios`, montado en `/consul/config/servicios.json`) el registro de `validator`, `extractor` y `persistence` (hostname, puerto `8000`, `tags` de Traefik y check TCP cada `1s`). MongoDB no se registra en Consul porque es responsabilidad exclusiva de Persistence. Traefik descubre los tres servicios mediante su provider `consulCatalog` (`--providers.consulcatalog.endpoint.address=consul:8500`, `exposedbydefault=false`, `refreshinterval=500ms`), sin requerir cambios en el código de ningún microservicio.
+- **Solo Traefik publica un puerto** (`PUBLIC_PORT`, por defecto `8080`, hacia su entrypoint `web`). La red `backend` es `internal`: los servicios internos, Consul y MongoDB no son accesibles desde el host ni tienen salida a internet.
+- **Providers de Traefik**:
+  - **Docker Provider** (`--providers.docker=true`, `exposedbydefault=false`): descubre únicamente al `orchestrator` en el entrypoint público `web` (`PathPrefix(/)`), que así responde también los 404 en RFC 9457.
+  - **Consul Catalog Provider** (`--providers.consulcatalog=true`, `endpoint.address=consul:8500`, `exposedbydefault=false`, `refreshinterval=500ms`): descubre dinámicamente a `validator`, `extractor` y `persistence` cuando están en estado `passing` y tienen `traefik.enable=true`.
+  - **File Provider** (`--providers.file.filename=/etc/traefik/dinamico.yml`): define el `serversTransport` compartido `interno` con `responseHeaderTimeout: 8s`.
+- **Registro dinámico con Consul**: `consul` corre como servidor en la red `backend` (`agent -dev -client=0.0.0.0`, sin publicar puertos ni cargar registros estáticos). `validator`, `extractor` y `persistence` dependen de `consul` (`service_healthy`) y se autorregistran al iniciar usando `CONSUL_URL=http://consul:8500` y `CONSUL_SERVICE_TAGS` (array JSON con los tags de Traefik). Cada servicio registra su propio healthcheck HTTP contra `/health` (intervalo `10s`, timeout `5s`, `DeregisterCriticalServiceAfter=1m`) y se desregistra al detenerse con `SIGTERM`. MongoDB no se registra en Consul porque es exclusivo de Persistence.
+- **Flujo de comunicación interno**: `Cliente → Traefik público (:8080 → :80) → Orchestrator → Traefik interno (:8081) → Validator → Extractor → Persistence → MongoDB`. El Orchestrator solo coordina por HTTP a través de `http://traefik:8081/<servicio>` y no consulta directamente a Consul.
 - **Entrypoint interno de Traefik** (`interno`, puerto `8081`, sin publicar): por ahí el Orchestrator llama a los tres servicios descubiertos en Consul. Solo es alcanzable desde la red de Docker.
 - **URLs internas por nombre de servicio**, nunca `localhost`: `http://traefik:8081/validator`, `http://traefik:8081/extractor`, `http://traefik:8081/persistence` y `mongodb://mongo:27017/?serverSelectionTimeoutMS=5000`. El `serverSelectionTimeoutMS` hace que Persistence falle en 5 s, antes de escribir, si MongoDB no responde; sin él pymongo espera 30 s, más que el timeout del Orchestrator.
 - **Datos de integración aislados**: base `pdf_extractext_integracion` y volumen `pdf-integracion-mongo-data`.
@@ -352,8 +357,7 @@ Cada servicio se construye desde su repositorio fijado a un **SHA completo** de 
 
 Cada contexto se puede reemplazar por una ruta local con `VALIDATOR_CONTEXT`, `EXTRACTOR_CONTEXT` y `PERSISTENCE_CONTEXT`. En ese caso, quien la use debe asegurarse de que el clon esté en el SHA indicado.
 
-- **Persistence** pasó de `95acae2` a `3d70c07` (su `main`). El contrato que consume el adapter no cambió (`POST /extractions` → `201 {"id"}`, `GET /extractions/{id}`), ni el `Dockerfile` ni sus dependencias. Lo nuevo es un `413` cuando el texto supera el límite de documento de MongoDB, que el adapter ya traduce a `502` como cualquier otro status.
-- **Extractor** sigue en `4166ba9`: su `main` actual solo agrega el circuit breaker a **su propio** Compose, que esta integración no usa; el código del servicio no cambió.
+- **Validator** (`43fbc5f2037b8a6d18eb4bc585d896b3d4a21c69`), **Extractor** (`fbb9069067cd66060ae6f0820658ccb7ebe796d4`) y **Persistence** (`11f59f5af8196328c743502616e6ce8eea4e57c5`) incorporan autorregistro dinámico en Consul (`CONSUL_URL` y `CONSUL_SERVICE_TAGS` en formato JSON), healthcheck HTTP en `/health` y desregistro en `SIGTERM`, manteniendo sin cambios los contratos HTTP que consume el Orchestrator.
 
 ### Circuit breaker
 
@@ -362,8 +366,8 @@ Si un servicio deja de responder, Traefik **deja de mandarle pedidos por un tiem
 Lo maneja **Traefik**, no el código Python, igual que en el Compose del Extractor. Se configura en `docker-compose.integration.yml`:
 
 - **Entrypoint interno** `interno` (`--entrypoints.interno.address=:8081`), sin publicar en el host.
-- **Por servicio**, con `tags` en su registro de Consul (`consul-servicios`): un router `PathPrefix(/<servicio>)` solo en `interno`, un middleware `<servicio>-circuit-breaker`, un middleware `<servicio>-sin-prefijo` que quita el prefijo (el servicio recibe sus rutas originales) y el `serversTransport` `interno@file`.
-- **Timeout**: el `serversTransport` `interno` se define con un file provider cuyo contenido está inline en `configs` del mismo Compose, porque las labels de Docker pueden referenciar un `serversTransport` pero no definirlo. No se usa `--serversTransport.forwardingTimeouts.responseHeaderTimeout` global, como en el Compose del Extractor, porque también cortaría el salto público Cliente → Traefik → Orchestrator antes de que el Orchestrator responda su Problem Details.
+- **Por servicio**, mediante la variable `CONSUL_SERVICE_TAGS` (array JSON que cada servicio publica al autorregistrarse en Consul): un router `PathPrefix(/<servicio>)` solo en `interno`, un middleware `<servicio>-circuit-breaker` aplicado antes de `<servicio>-sin-prefijo` (que quita el prefijo para que el servicio reciba sus rutas originales) y el `serversTransport` `interno@file`. Traefik toma el puerto `8000` directamente del registro del servicio en Consul.
+- **Timeout**: el `serversTransport` `interno` se define con un file provider cuyo contenido está inline en `configs` del mismo Compose, porque las labels/tags pueden referenciar un `serversTransport` pero no definirlo. No se usa `--serversTransport.forwardingTimeouts.responseHeaderTimeout` global, como en el Compose del Extractor, porque también cortaría el salto público Cliente → Traefik → Orchestrator antes de que el Orchestrator responda su Problem Details.
 
 ```
 CERRADO ──más del 50% de errores de red──► ABIERTO ──10 s──► SEMIABIERTO ──10 s sin fallar──► CERRADO
@@ -381,7 +385,7 @@ CERRADO ──más del 50% de errores de red──► ABIERTO ──10 s──�
 - **Independientes**: cada servicio tiene su propio middleware y su propio router. Con el circuito del Validator abierto, Extractor y Persistence siguen respondiendo `200` (verificado en la prueba de humo).
 - **Backpressure del Extractor**: su `503` intencional (cola llena, `application/problem+json` con `Retry-After`) no es un error de red y **no abre el circuito**. Se verificó con una ráfaga de 150 pedidos concurrentes a `traefik:8081/extractor/api/v1/extraer`: 105 respondieron `503` del Extractor (70 %, más que el umbral) y 45 `200`, sin ningún `504`. Inmediatamente después, `GET /extractor/health` respondió `200` en ~12 ms y Traefik no registró ningún cambio de estado del circuito.
 - **Límite conocido**: un pedido que espere en la cola del Extractor más de 8 s recibe el `504` de Traefik, y ese sí cuenta. En la ráfaga anterior ningún pedido llegó a 8 s (el más lento tardó ~5 s); con PDFs más pesados podría pasar.
-- **`stop` y `pause` no son lo mismo.** Con `docker compose stop`, el check TCP de Consul falla (`critical`), Traefik deja de descubrir el contenedor en `consulCatalog`, borra su ruta y responde `404` sin pasar por el circuit breaker. Con `docker compose pause`, el kernel sigue aceptando la conexión TCP, Traefik corta con `504` a los 8 s y el circuito se abre. La label `traefik.docker.allownonrunning=true`, que según la documentación respondería `503` con el contenedor detenido, **se descartó**: en Traefik v3.6.25 respondió `500` (`unsupported protocol scheme ""`), que tampoco cuenta para el circuito.
+- **`stop` y `pause` no son lo mismo.** Con `docker compose stop`, el servicio recibe `SIGTERM`, se desregistra de Consul, Traefik deja de descubrirlo en `consulCatalog`, borra su ruta y responde `404` sin pasar por el circuit breaker. Con `docker compose pause`, el kernel sigue aceptando la conexión TCP, Traefik corta con `504` a los 8 s y el circuito se abre; si la pausa se prolonga más que el healthcheck HTTP de Consul (intervalo `10s`, timeout `5s`), Consul marca el servicio como `critical` y Traefik retira la ruta hasta que vuelva a `passing`. La label `traefik.docker.allownonrunning=true`, que según la documentación respondería `503` con el contenedor detenido, **se descartó**: en Traefik v3.6.25 respondió `500` (`unsupported protocol scheme ""`), que tampoco cuenta para el circuito.
 - La traducción al cliente de estas respuestas está en [Respuestas de Traefik](#respuestas-de-traefik-y-su-traducción).
 
 **Cómo comprobarlo** con el stack levantado (ejemplo con el Validator; vale igual para `extractor` y `persistence`). La sonda hace un `GET` desde el contenedor del Orchestrator, porque el entrypoint interno no está publicado:

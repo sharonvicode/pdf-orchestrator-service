@@ -25,92 +25,6 @@ configs:
             forwardingTimeouts:
               responseHeaderTimeout: 8s
 
-  # Registro de los tres servicios internos en Consul (solo en la red backend; MongoDB no se registra
-  # porque es exclusivo de Persistence). Traefik los descubre por consulCatalog leyendo sus tags:
-  # - router solo en el entrypoint interno, para las URLs del Orchestrator traefik:8081/<servicio>;
-  # - circuit breaker propio: se abre si más de la mitad de las respuestas son errores de red
-  #   (502/504: servicio inalcanzable o timeout de 8 s); el 503 del backpressure del Extractor no
-  #   cuenta. Abierto, responde 503 al instante durante 10 s y luego se recupera de a poco en 10 s;
-  # - sin-prefijo: el servicio recibe sus rutas originales (/validate, /api/v1/extraer, /extractions);
-  # - serversTransport interno@file: el timeout de 8 s definido en traefik-dinamico;
-  # - check TCP: si el contenedor se detiene (stop), el check falla y Traefik quita la ruta (404); si
-  #   se congela (pause), el kernel sigue aceptando el handshake TCP y Traefik aplica el timeout (504).
-  consul-servicios:
-    content: |
-      {
-        "services": [
-          {
-            "id": "validator",
-            "name": "validator",
-            "address": "validator",
-            "port": 8000,
-            "tags": [
-              "traefik.enable=true",
-              "traefik.http.routers.validator.rule=PathPrefix(`/validator`)",
-              "traefik.http.routers.validator.entrypoints=interno",
-              "traefik.http.routers.validator.middlewares=validator-circuit-breaker,validator-sin-prefijo",
-              "traefik.http.middlewares.validator-sin-prefijo.stripprefix.prefixes=/validator",
-              "traefik.http.middlewares.validator-circuit-breaker.circuitbreaker.expression=NetworkErrorRatio() > 0.50",
-              "traefik.http.middlewares.validator-circuit-breaker.circuitbreaker.fallbackDuration=10s",
-              "traefik.http.middlewares.validator-circuit-breaker.circuitbreaker.recoveryDuration=10s",
-              "traefik.http.services.validator.loadbalancer.server.port=8000",
-              "traefik.http.services.validator.loadbalancer.serverstransport=interno@file"
-            ],
-            "check": {
-              "tcp": "validator:8000",
-              "interval": "1s",
-              "timeout": "1s"
-            }
-          },
-          {
-            "id": "extractor",
-            "name": "extractor",
-            "address": "extractor",
-            "port": 8000,
-            "tags": [
-              "traefik.enable=true",
-              "traefik.http.routers.extractor.rule=PathPrefix(`/extractor`)",
-              "traefik.http.routers.extractor.entrypoints=interno",
-              "traefik.http.routers.extractor.middlewares=extractor-circuit-breaker,extractor-sin-prefijo",
-              "traefik.http.middlewares.extractor-sin-prefijo.stripprefix.prefixes=/extractor",
-              "traefik.http.middlewares.extractor-circuit-breaker.circuitbreaker.expression=NetworkErrorRatio() > 0.50",
-              "traefik.http.middlewares.extractor-circuit-breaker.circuitbreaker.fallbackDuration=10s",
-              "traefik.http.middlewares.extractor-circuit-breaker.circuitbreaker.recoveryDuration=10s",
-              "traefik.http.services.extractor.loadbalancer.server.port=8000",
-              "traefik.http.services.extractor.loadbalancer.serverstransport=interno@file"
-            ],
-            "check": {
-              "tcp": "extractor:8000",
-              "interval": "1s",
-              "timeout": "1s"
-            }
-          },
-          {
-            "id": "persistence",
-            "name": "persistence",
-            "address": "persistence",
-            "port": 8000,
-            "tags": [
-              "traefik.enable=true",
-              "traefik.http.routers.persistence.rule=PathPrefix(`/persistence`)",
-              "traefik.http.routers.persistence.entrypoints=interno",
-              "traefik.http.routers.persistence.middlewares=persistence-circuit-breaker,persistence-sin-prefijo",
-              "traefik.http.middlewares.persistence-sin-prefijo.stripprefix.prefixes=/persistence",
-              "traefik.http.middlewares.persistence-circuit-breaker.circuitbreaker.expression=NetworkErrorRatio() > 0.50",
-              "traefik.http.middlewares.persistence-circuit-breaker.circuitbreaker.fallbackDuration=10s",
-              "traefik.http.middlewares.persistence-circuit-breaker.circuitbreaker.recoveryDuration=10s",
-              "traefik.http.services.persistence.loadbalancer.server.port=8000",
-              "traefik.http.services.persistence.loadbalancer.serverstransport=interno@file"
-            ],
-            "check": {
-              "tcp": "persistence:8000",
-              "interval": "1s",
-              "timeout": "1s"
-            }
-          }
-        ]
-      }
-
 services:
   traefik:
     image: traefik:v3.6
@@ -152,18 +66,8 @@ services:
       - agent
       - -dev
       - -client=0.0.0.0
-    configs:
-      - source: consul-servicios
-        target: /consul/config/servicios.json
     networks:
       - backend
-    depends_on:
-      validator:
-        condition: service_healthy
-      extractor:
-        condition: service_healthy
-      persistence:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "consul", "members"]
       interval: 10s
@@ -215,11 +119,27 @@ services:
 
   validator:
     build:
-      context: "${VALIDATOR_CONTEXT:-https://github.com/sharonvicode/pdf-validator-service.git#79e22ae3e734d05567c50805ac0eab33d3cbdc5b}"
+      context: "${VALIDATOR_CONTEXT:-https://github.com/sharonvicode/pdf-validator-service.git#43fbc5f2037b8a6d18eb4bc585d896b3d4a21c69}"
     environment:
       MAX_FILE_SIZE_MB: "10"
+      CONSUL_URL: http://consul:8500
+      CONSUL_SERVICE_TAGS: >-
+        [
+          "traefik.enable=true",
+          "traefik.http.routers.validator.rule=PathPrefix(`/validator`)",
+          "traefik.http.routers.validator.entrypoints=interno",
+          "traefik.http.routers.validator.middlewares=validator-circuit-breaker,validator-sin-prefijo",
+          "traefik.http.middlewares.validator-sin-prefijo.stripprefix.prefixes=/validator",
+          "traefik.http.middlewares.validator-circuit-breaker.circuitbreaker.expression=NetworkErrorRatio() > 0.50",
+          "traefik.http.middlewares.validator-circuit-breaker.circuitbreaker.fallbackDuration=10s",
+          "traefik.http.middlewares.validator-circuit-breaker.circuitbreaker.recoveryDuration=10s",
+          "traefik.http.services.validator.loadbalancer.serverstransport=interno@file"
+        ]
     networks:
       - backend
+    depends_on:
+      consul:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
       interval: 10s
@@ -234,15 +154,31 @@ services:
 
   extractor:
     build:
-      context: "${EXTRACTOR_CONTEXT:-https://github.com/sharonvicode/pdf-extract-service.git#4166ba994cdebf6102f3608774b643bb751d2a4c}"
+      context: "${EXTRACTOR_CONTEXT:-https://github.com/sharonvicode/pdf-extract-service.git#fbb9069067cd66060ae6f0820658ccb7ebe796d4}"
     environment:
       MAX_FILE_SIZE_MB: "10"
       EXTRACTION_CONCURRENCY: "1"
       EXTRACTION_QUEUE_SIZE: "20"
       RETRY_AFTER_SECONDS: "1"
       LOG_LEVEL: INFO
+      CONSUL_URL: http://consul:8500
+      CONSUL_SERVICE_TAGS: >-
+        [
+          "traefik.enable=true",
+          "traefik.http.routers.extractor.rule=PathPrefix(`/extractor`)",
+          "traefik.http.routers.extractor.entrypoints=interno",
+          "traefik.http.routers.extractor.middlewares=extractor-circuit-breaker,extractor-sin-prefijo",
+          "traefik.http.middlewares.extractor-sin-prefijo.stripprefix.prefixes=/extractor",
+          "traefik.http.middlewares.extractor-circuit-breaker.circuitbreaker.expression=NetworkErrorRatio() > 0.50",
+          "traefik.http.middlewares.extractor-circuit-breaker.circuitbreaker.fallbackDuration=10s",
+          "traefik.http.middlewares.extractor-circuit-breaker.circuitbreaker.recoveryDuration=10s",
+          "traefik.http.services.extractor.loadbalancer.serverstransport=interno@file"
+        ]
     networks:
       - backend
+    depends_on:
+      consul:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
       interval: 10s
@@ -257,16 +193,31 @@ services:
 
   persistence:
     build:
-      context: "${PERSISTENCE_CONTEXT:-https://github.com/sharonvicode/pdf-persistence-service.git#3d70c07fc2ad0cede5b9e56e4f1ae438f0168cb7}"
+      context: "${PERSISTENCE_CONTEXT:-https://github.com/sharonvicode/pdf-persistence-service.git#11f59f5af8196328c743502616e6ce8eea4e57c5}"
     environment:
       # serverSelectionTimeoutMS: si MongoDB no responde, Persistence falla a los 5 s (antes de
       # escribir) en lugar de los 30 s por defecto de pymongo, que superan el timeout del Orchestrator.
       MONGODB_URI: mongodb://mongo:27017/?serverSelectionTimeoutMS=5000
       MONGODB_DATABASE: pdf_extractext_integracion
+      CONSUL_URL: http://consul:8500
+      CONSUL_SERVICE_TAGS: >-
+        [
+          "traefik.enable=true",
+          "traefik.http.routers.persistence.rule=PathPrefix(`/persistence`)",
+          "traefik.http.routers.persistence.entrypoints=interno",
+          "traefik.http.routers.persistence.middlewares=persistence-circuit-breaker,persistence-sin-prefijo",
+          "traefik.http.middlewares.persistence-sin-prefijo.stripprefix.prefixes=/persistence",
+          "traefik.http.middlewares.persistence-circuit-breaker.circuitbreaker.expression=NetworkErrorRatio() > 0.50",
+          "traefik.http.middlewares.persistence-circuit-breaker.circuitbreaker.fallbackDuration=10s",
+          "traefik.http.middlewares.persistence-circuit-breaker.circuitbreaker.recoveryDuration=10s",
+          "traefik.http.services.persistence.loadbalancer.serverstransport=interno@file"
+        ]
     networks:
       - backend
     depends_on:
       mongo:
+        condition: service_healthy
+      consul:
         condition: service_healthy
     healthcheck:
       # Solo comprueba que el PROCESO responde (FastAPI expone /openapi.json por defecto).
