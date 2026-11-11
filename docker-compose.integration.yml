@@ -119,7 +119,7 @@ services:
 
   validator:
     build:
-      context: "${VALIDATOR_CONTEXT:-https://github.com/sharonvicode/pdf-validator-service.git#43fbc5f2037b8a6d18eb4bc585d896b3d4a21c69}"
+      context: "${VALIDATOR_CONTEXT:-https://github.com/sharonvicode/pdf-validator-service.git#609f2e47a9ddf1e68a9a148984679361ad7eabfe}"
     environment:
       MAX_FILE_SIZE_MB: "10"
       CONSUL_URL: http://consul:8500

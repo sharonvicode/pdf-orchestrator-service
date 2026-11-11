@@ -333,7 +333,7 @@ host :8080 → traefik (web :80) → orchestrator → traefik (interno :8081) �
 | `traefik` | `traefik:v3.6` | `edge` y `backend` | — (lo verifica la prueba de humo con `GET /health`) |
 | `consul` | `hashicorp/consul:1.20` | `backend` | `consul members` |
 | `orchestrator` | este repositorio (`build: .`) | `edge` y `backend` | `GET /health` |
-| `validator` | `pdf-validator-service` @ `43fbc5f2037b8a6d18eb4bc585d896b3d4a21c69` | `backend` | `GET /health` |
+| `validator` | `pdf-validator-service` @ `609f2e47a9ddf1e68a9a148984679361ad7eabfe` | `backend` | `GET /health` |
 | `extractor` | `pdf-extract-service` @ `fbb9069067cd66060ae6f0820658ccb7ebe796d4` | `backend` | `GET /health` |
 | `persistence` | `pdf-persistence-service` @ `11f59f5af8196328c743502616e6ce8eea4e57c5` | `backend` | `GET /openapi.json`: **solo el proceso** (ver abajo) |
 | `mongo` | `mongo:8.0` | `backend` | `db.adminCommand('ping')` |
@@ -357,7 +357,7 @@ Cada servicio se construye desde su repositorio fijado a un **SHA completo** de 
 
 Cada contexto se puede reemplazar por una ruta local con `VALIDATOR_CONTEXT`, `EXTRACTOR_CONTEXT` y `PERSISTENCE_CONTEXT`. En ese caso, quien la use debe asegurarse de que el clon esté en el SHA indicado.
 
-- **Validator** (`43fbc5f2037b8a6d18eb4bc585d896b3d4a21c69`), **Extractor** (`fbb9069067cd66060ae6f0820658ccb7ebe796d4`) y **Persistence** (`11f59f5af8196328c743502616e6ce8eea4e57c5`) incorporan autorregistro dinámico en Consul (`CONSUL_URL` y `CONSUL_SERVICE_TAGS` en formato JSON), healthcheck HTTP en `/health` y desregistro en `SIGTERM`, manteniendo sin cambios los contratos HTTP que consume el Orchestrator.
+- **Validator** (`609f2e47a9ddf1e68a9a148984679361ad7eabfe`), **Extractor** (`fbb9069067cd66060ae6f0820658ccb7ebe796d4`) y **Persistence** (`11f59f5af8196328c743502616e6ce8eea4e57c5`) incorporan autorregistro dinámico en Consul (`CONSUL_URL` y `CONSUL_SERVICE_TAGS` en formato JSON), healthcheck HTTP en `/health` y desregistro en `SIGTERM`, manteniendo sin cambios los contratos HTTP que consume el Orchestrator.
 
 ### Circuit breaker
 

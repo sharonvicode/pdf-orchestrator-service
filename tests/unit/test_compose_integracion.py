@@ -17,7 +17,7 @@ import yaml
 COMPOSE_FILE = Path(__file__).parents[2] / "docker-compose.integration.yml"
 SERVICIOS = ("validator", "extractor", "persistence")
 SHAS_ESPERADOS = {
-    "validator": "43fbc5f2037b8a6d18eb4bc585d896b3d4a21c69",
+    "validator": "609f2e47a9ddf1e68a9a148984679361ad7eabfe",
     "extractor": "fbb9069067cd66060ae6f0820658ccb7ebe796d4",
     "persistence": "11f59f5af8196328c743502616e6ce8eea4e57c5",
 }
